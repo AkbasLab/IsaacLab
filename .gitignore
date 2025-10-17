@@ -69,3 +69,10 @@ tests/
 
 # Docker history
 .isaac-lab-docker-history
+
+# Venv
+/env_isaaclab/
+
+# Misc
+/2.7.0+cu128
+
