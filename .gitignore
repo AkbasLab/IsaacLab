@@ -73,6 +73,9 @@ tests/
 # Venv
 /env_isaaclab/
 
+# Graphs/Metrics
+/plots/
+
 # Misc
 /2.7.0+cu128
 
