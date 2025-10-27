@@ -41,6 +41,24 @@ parser.add_argument("--checkpoint", type=str, default=None, help="Path to model 
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
 parser.add_argument(
+    "--export_onnx",
+    action="store_true",
+    default=False,
+    help="Export the trained policy to ONNX at the end of training (PyTorch only).",
+)
+parser.add_argument(
+    "--onnx_opset",
+    type=int,
+    default=17,
+    help="ONNX opset version to use when exporting (PyTorch only).",
+)
+parser.add_argument(
+    "--onnx_filename",
+    type=str,
+    default="policy.onnx",
+    help="Filename for the exported ONNX model (saved under the run's exported/ folder).",
+)
+parser.add_argument(
     "--ml_framework",
     type=str,
     default="torch",
@@ -217,6 +235,139 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # run training
     runner.run()
+
+    # optional: export trained policy to ONNX (PyTorch only)
+    if args_cli.export_onnx and args_cli.ml_framework.startswith("torch"):
+        try:
+            import torch
+
+            # Build a dummy observation tensor from a real reset, which matches skrl expectations
+            obs_sample = None
+            try:
+                obs_reset, _ = env.reset()
+                obs_sample = obs_reset
+            except Exception:
+                obs_sample = None
+
+            def _to_batched_tensor(x, device):
+                if isinstance(x, torch.Tensor):
+                    t = x
+                else:
+                    import numpy as np
+
+                    if isinstance(x, (list, tuple)):
+                        x = x[0]
+                    t = torch.as_tensor(x, dtype=torch.float32)
+                if t.ndim == 1:
+                    t = t.unsqueeze(0)
+                elif t.ndim > 1:
+                    t = t[:1]
+                return t.to(device)
+
+            agent_device = getattr(runner.agent, "device", "cpu")
+
+            if obs_sample is None:
+                # last resort: try to infer from env attributes
+                obs_space = getattr(env, "single_observation_space", None) or getattr(env, "observation_space", None)
+                if (obs_space is not None) and hasattr(obs_space, "shape") and (getattr(obs_space, "shape", None) is not None):
+                    obs_shape = (1,) + tuple(obs_space.shape)
+                    dummy_obs = torch.zeros(obs_shape, dtype=torch.float32, device=agent_device)
+                else:
+                    dummy_obs = None
+            else:
+                # handle dict-like observations by taking the first tensor-like value
+                if isinstance(obs_sample, dict):
+                    # prefer common keys
+                    preferred_keys = ["policy", "states", "obs", "observations"]
+                    sel = None
+                    for k in preferred_keys:
+                        if k in obs_sample:
+                            sel = obs_sample[k]
+                            break
+                    if sel is None and len(obs_sample):
+                        sel = next(iter(obs_sample.values()))
+                    dummy_obs = _to_batched_tensor(sel, agent_device) if sel is not None else None
+                else:
+                    dummy_obs = _to_batched_tensor(obs_sample, agent_device)
+
+            export_dir = os.path.join(log_dir, "exported")
+            os.makedirs(export_dir, exist_ok=True)
+            onnx_path = os.path.join(export_dir, args_cli.onnx_filename)
+
+            # Prefer exporting the actual policy model to keep parameters registered
+            policy_model = None
+            if hasattr(runner.agent, "models") and isinstance(getattr(runner.agent, "models"), dict):
+                models = getattr(runner.agent, "models")
+                policy_model = models.get("policy") or models.get("actor") or None
+            # some agents expose .policy / .actor directly
+            if policy_model is None:
+                policy_model = getattr(runner.agent, "policy", None) or getattr(runner.agent, "actor", None)
+
+            if dummy_obs is not None and isinstance(policy_model, torch.nn.Module):
+                class _PolicyComputeWrapper(torch.nn.Module):
+                    def __init__(self, model):
+                        super().__init__()
+                        self.model = model
+
+                    def forward(self, obs):
+                        # SKRL models expect a dict with key 'states' for policy role
+                        out = self.model.compute({"states": obs}, role="policy")
+                        # out: (mean, log_std, info)
+                        if isinstance(out, (list, tuple)) and len(out) >= 1:
+                            return out[0]
+                        return out
+
+                model_cpu = policy_model.eval().cpu()
+                wrapper = _PolicyComputeWrapper(model_cpu)
+                dummy_cpu = dummy_obs.detach().cpu()
+                dynamic_axes = {"obs": {0: "batch"}, "actions": {0: "batch"}}
+                torch.onnx.export(
+                    wrapper,
+                    (dummy_cpu,),
+                    onnx_path,
+                    export_params=True,
+                    opset_version=int(args_cli.onnx_opset),
+                    do_constant_folding=True,
+                    input_names=["obs"],
+                    output_names=["actions"],
+                    dynamic_axes=dynamic_axes,
+                )
+                print(f"[INFO] Exported policy (compute->mean) to ONNX: {onnx_path}")
+            elif dummy_obs is not None:
+                # Fallback: export via agent.act wrapper (may fail if parameters aren't registered)
+                class _SkrlActWrapper(torch.nn.Module):
+                    def __init__(self, agent):
+                        super().__init__()
+                        self._agent = agent
+
+                    def forward(self, obs):  # obs: [B, obs_dim]
+                        with torch.no_grad():
+                            outputs = self._agent.act(obs, timestep=0, timesteps=0)
+                            if isinstance(outputs, (list, tuple)):
+                                info = outputs[-1] if len(outputs) >= 3 and isinstance(outputs[-1], dict) else {}
+                                actions = info.get("mean_actions", outputs[0])
+                            else:
+                                actions = outputs
+                        return actions
+
+                wrapper = _SkrlActWrapper(runner.agent)
+                dynamic_axes = {"obs": {0: "batch"}, "actions": {0: "batch"}}
+                torch.onnx.export(
+                    wrapper,
+                    (dummy_obs,),
+                    onnx_path,
+                    export_params=True,
+                    opset_version=int(args_cli.onnx_opset),
+                    do_constant_folding=True,
+                    input_names=["obs"],
+                    output_names=["actions"],
+                    dynamic_axes=dynamic_axes,
+                )
+                print(f"[INFO] Exported policy via act() wrapper to ONNX: {onnx_path}")
+            else:
+                print("[WARN] Could not obtain a sample observation for ONNX export; skipping.")
+        except Exception as e:
+            print(f"[WARN] ONNX export failed: {e}")
 
     # close the simulator
     env.close()
