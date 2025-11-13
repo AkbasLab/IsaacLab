@@ -28,6 +28,9 @@ from isaaclab.utils.math import subtract_frame_transforms
 from isaaclab_assets import CRAZYFLIE_CFG  # isort: skip
 from isaaclab.markers import CUBOID_MARKER_CFG  # isort: skip
 
+# IMU video recorder
+from .imu_video_recorder import IMUVideoRecorder  # isort: skip
+
 
 class QuadcopterEnvWindow(BaseEnvWindow):
     """Window manager for the Quadcopter environment."""
@@ -118,6 +121,11 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
 
     imu_noise: ImuNoiseCfg = ImuNoiseCfg()
 
+    # IMU video recording
+    enable_imu_video: bool = False  # Enable IMU data video recording
+    imu_video_fps: int = 50  # Frames per second for video
+    imu_video_record_interval: int = 10  # Record frame every N steps
+
     thrust_to_weight = 1.9
     moment_scale = 0.01
 
@@ -187,6 +195,29 @@ class QuadcopterEnv(DirectRLEnv):
 
         self._imu_log_interval = 100
         self._last_imu_log_step = -1
+
+        # Initialize IMU video recorder if enabled
+        self._imu_video_recorder = None
+        self._imu_video_step_counter = 0
+        if self.cfg.enable_imu_video:
+            from pathlib import Path
+            video_dir = Path(self.cfg.sim.device).parent / "videos"  # Use a sensible default
+            # Try to get a better path from experiment logger if available
+            try:
+                import os
+                log_dir = os.environ.get("ISAACLAB_LOG_DIR", "logs")
+                video_dir = Path(log_dir) / "videos"
+            except:
+                video_dir = Path("videos")
+            
+            self._imu_video_recorder = IMUVideoRecorder(
+                output_dir=str(video_dir),
+                env_index=0,  # Record environment 0
+                max_samples=15000,
+                fps=self.cfg.imu_video_fps,
+                video_name="imu_data_visualization.mp4"
+            )
+            print(f"[Quadcopter] IMU video recording enabled, saving to: {video_dir}")
 
         # Logging
         self._episode_sums = {
@@ -287,6 +318,22 @@ class QuadcopterEnv(DirectRLEnv):
             dim=-1,
         )
         observations = {"policy": obs}
+        
+        # Record IMU data for video if enabled
+        if self._imu_video_recorder is not None:
+            self._imu_video_step_counter += 1
+            # Record every step
+            self._imu_video_recorder.record_step(
+                dt=self.step_dt,
+                pos_w=self._robot.data.root_pos_w,
+                euler_angles=euler_angles,
+                lin_acc_b=lin_acc_b,
+                ang_vel_b=ang_vel_b
+            )
+            # Generate frame at specified interval
+            if self._imu_video_step_counter % self.cfg.imu_video_record_interval == 0:
+                self._imu_video_recorder.generate_frame()
+        
         return observations
 
     def _get_rewards(self) -> torch.Tensor:
@@ -437,3 +484,10 @@ class QuadcopterEnv(DirectRLEnv):
     def _debug_vis_callback(self, event):
         # update the markers
         self.goal_pos_visualizer.visualize(self._desired_pos_w)
+    
+    def close(self):
+        """Save IMU video and cleanup resources."""
+        if self._imu_video_recorder is not None:
+            print("[Quadcopter] Saving IMU visualization video...")
+            self._imu_video_recorder.save_video()
+        super().close()

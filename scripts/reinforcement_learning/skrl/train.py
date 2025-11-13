@@ -39,6 +39,7 @@ parser.add_argument(
 )
 parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint to resume training.")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
+parser.add_argument("--imu_video", action="store_true", default=False, help="Record IMU data visualization video.")
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
 parser.add_argument(
     "--export_onnx",
@@ -145,6 +146,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # override configurations with non-hydra CLI arguments
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    
+    # enable IMU video recording if requested
+    if args_cli.imu_video and hasattr(env_cfg, 'enable_imu_video'):
+        env_cfg.enable_imu_video = True
+        print("[Train Script] IMU video recording enabled")
 
     # multi-gpu training config
     if args_cli.distributed:
