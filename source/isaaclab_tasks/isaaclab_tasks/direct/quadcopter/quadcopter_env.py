@@ -55,7 +55,7 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     episode_length_s = 10.0
     decimation = 2
     action_space = 4
-    observation_space = 12  # lin_acc_b(3) + ang_vel_b(3) + projected_gravity_b(3) + desired_pos_b(3)
+    observation_space = 12  # lin_acc_b(3) + ang_vel_b(3) + euler_angles(3) + desired_pos_b(3)
     state_space = 0
     debug_vis = True
 
@@ -106,6 +106,18 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
         debug_vis=False,
     )
 
+    # IMU noise parameters (realistic values for MEMS IMU like MPU6050/BMI160)
+    @configclass
+    class ImuNoiseCfg:
+        # Accelerometer noise (m/s^2)
+        lin_acc_noise_std: tuple[float, float, float] = (0.4, 0.4, 0.4)  # White noise
+        lin_acc_bias_std: tuple[float, float, float] = (0.3, 0.3, 0.3)    # Bias drift
+        # Gyroscope noise (rad/s)
+        ang_vel_noise_std: tuple[float, float, float] = (0.02, 0.02, 0.02)  # White noise
+        ang_vel_bias_std: tuple[float, float, float] = (0.01, 0.01, 0.01)    # Bias drift
+
+    imu_noise: ImuNoiseCfg = ImuNoiseCfg()
+
     thrust_to_weight = 1.9
     moment_scale = 0.01
 
@@ -153,6 +165,25 @@ class QuadcopterEnv(DirectRLEnv):
         self._moment = torch.zeros(self.num_envs, 1, 3, device=self.device)
         # Goal position
         self._desired_pos_w = torch.zeros(self.num_envs, 3, device=self.device)
+        
+        # IMU noise and bias simulation
+        imu_noise_cfg = self.cfg.imu_noise
+        self._imu_lin_acc_noise_std = torch.tensor(imu_noise_cfg.lin_acc_noise_std, device=self.device).view(1, 3)
+        self._imu_ang_vel_noise_std = torch.tensor(imu_noise_cfg.ang_vel_noise_std, device=self.device).view(1, 3)
+        self._imu_lin_acc_bias_std = torch.tensor(imu_noise_cfg.lin_acc_bias_std, device=self.device).view(1, 3)
+        self._imu_ang_vel_bias_std = torch.tensor(imu_noise_cfg.ang_vel_bias_std, device=self.device).view(1, 3)
+        
+        # Initialize bias and noise buffers
+        self._imu_lin_acc_bias = torch.zeros(self.num_envs, 3, device=self.device)
+        self._imu_ang_vel_bias = torch.zeros(self.num_envs, 3, device=self.device)
+        self._imu_lin_acc_noise = torch.zeros_like(self._imu_lin_acc_bias)
+        self._imu_ang_vel_noise = torch.zeros_like(self._imu_ang_vel_bias)
+        
+        # Check if noise/bias is enabled
+        self._imu_has_lin_acc_noise = torch.any(self._imu_lin_acc_noise_std != 0.0).item()
+        self._imu_has_ang_vel_noise = torch.any(self._imu_ang_vel_noise_std != 0.0).item()
+        self._imu_has_lin_acc_bias = torch.any(self._imu_lin_acc_bias_std != 0.0).item()
+        self._imu_has_ang_vel_bias = torch.any(self._imu_ang_vel_bias_std != 0.0).item()
 
         self._imu_log_interval = 100
         self._last_imu_log_step = -1
@@ -202,9 +233,16 @@ class QuadcopterEnv(DirectRLEnv):
     def _apply_action(self):
         self._robot.set_external_force_and_torque(self._thrust, self._moment, body_ids=self._body_id)
 
-    def _resample_imu_bias(self, env_ids: torch.Tensor | slice):
-        # Noise injection disabled for diagnostics
-        return
+    def _resample_imu_bias(self, env_ids: torch.Tensor):
+        """Resample IMU bias for the given environments (simulates bias drift on reset)."""
+        if self._imu_has_lin_acc_bias:
+            self._imu_lin_acc_bias[env_ids] = torch.randn_like(
+                self._imu_lin_acc_bias[env_ids]
+            ) * self._imu_lin_acc_bias_std
+        if self._imu_has_ang_vel_bias:
+            self._imu_ang_vel_bias[env_ids] = torch.randn_like(
+                self._imu_ang_vel_bias[env_ids]
+            ) * self._imu_ang_vel_bias_std
 
     def _get_observations(self) -> dict:
         desired_pos_b, _ = subtract_frame_transforms(
@@ -212,15 +250,39 @@ class QuadcopterEnv(DirectRLEnv):
         )
         self._log_imu_debug()
 
-        # Use IMU sensor data instead of perfect state
-        # IMU provides: lin_acc_b (linear acceleration), ang_vel_b (angular velocity), projected_gravity_b
+        # Use IMU sensor data matching real Crazyflie hardware
+        # Crazyflie provides: acc.x/y/z, gyro.x/y/z, stabilizer.roll/pitch/yaw
         imu_data = self._imu.data
+        
+        # Apply realistic IMU noise and bias
+        # Linear acceleration: raw + bias + white_noise (matches Crazyflie acc.x/y/z)
+        lin_acc_b = imu_data.lin_acc_b.clone()
+        if self._imu_has_lin_acc_bias:
+            lin_acc_b += self._imu_lin_acc_bias
+        if self._imu_has_lin_acc_noise:
+            self._imu_lin_acc_noise = torch.randn_like(self._imu_lin_acc_noise) * self._imu_lin_acc_noise_std
+            lin_acc_b += self._imu_lin_acc_noise
+        
+        # Angular velocity: raw + bias + white_noise (matches Crazyflie gyro.x/y/z)
+        ang_vel_b = imu_data.ang_vel_b.clone()
+        if self._imu_has_ang_vel_bias:
+            ang_vel_b += self._imu_ang_vel_bias
+        if self._imu_has_ang_vel_noise:
+            self._imu_ang_vel_noise = torch.randn_like(self._imu_ang_vel_noise) * self._imu_ang_vel_noise_std
+            ang_vel_b += self._imu_ang_vel_noise
+        
+        # Extract Euler angles from quaternion (matches Crazyflie stabilizer.roll/pitch/yaw)
+        # This replaces projected_gravity_b which is not available on real hardware
+        quat = self._robot.data.root_quat_w  # (num_envs, 4) in [w, x, y, z] format
+        # Convert quaternion to Euler angles (roll, pitch, yaw)
+        euler_angles = self._quat_to_euler(quat)
+        
         obs = torch.cat(
             [
-                imu_data.lin_acc_b,        # Linear acceleration from IMU (3)
-                imu_data.ang_vel_b,        # Angular velocity from IMU (3)
-                imu_data.projected_gravity_b,  # Gravity vector from IMU (3)
-                desired_pos_b,             # Desired position in body frame (3)
+                lin_acc_b,      # Noisy linear acceleration from IMU (3) - matches acc.x/y/z
+                ang_vel_b,      # Noisy angular velocity from IMU (3) - matches gyro.x/y/z
+                euler_angles,   # Euler angles (roll, pitch, yaw) (3) - matches stabilizer.roll/pitch/yaw
+                desired_pos_b,  # Desired position in body frame (3)
             ],
             dim=-1,
         )
@@ -284,6 +346,9 @@ class QuadcopterEnv(DirectRLEnv):
             # Spread out the resets to avoid spikes in training when many environments reset at a similar time
             self.episode_length_buf = torch.randint_like(self.episode_length_buf, high=int(self.max_episode_length))
 
+        # Resample IMU bias on environment reset (simulates sensor drift)
+        self._resample_imu_bias(env_ids_tensor)
+        
         self._actions[env_ids_tensor] = 0.0
         # Sample new commands
         self._desired_pos_w[env_ids_tensor, :2] = torch.zeros_like(
@@ -307,6 +372,37 @@ class QuadcopterEnv(DirectRLEnv):
             self._imu.reset(None)
         else:
             self._imu.reset(env_ids_tensor.tolist())
+
+    def _quat_to_euler(self, quat: torch.Tensor) -> torch.Tensor:
+        """Convert quaternion to Euler angles (roll, pitch, yaw) in radians.
+        
+        Args:
+            quat: Quaternion tensor in [w, x, y, z] format, shape (num_envs, 4)
+        
+        Returns:
+            Euler angles tensor (roll, pitch, yaw) in radians, shape (num_envs, 3)
+        """
+        w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+        
+        # Roll (x-axis rotation)
+        sinr_cosp = 2 * (w * x + y * z)
+        cosr_cosp = 1 - 2 * (x * x + y * y)
+        roll = torch.atan2(sinr_cosp, cosr_cosp)
+        
+        # Pitch (y-axis rotation)
+        sinp = 2 * (w * y - z * x)
+        pitch = torch.where(
+            torch.abs(sinp) >= 1,
+            torch.copysign(torch.tensor(torch.pi / 2, device=quat.device), sinp),
+            torch.asin(sinp)
+        )
+        
+        # Yaw (z-axis rotation)
+        siny_cosp = 2 * (w * z + x * y)
+        cosy_cosp = 1 - 2 * (y * y + z * z)
+        yaw = torch.atan2(siny_cosp, cosy_cosp)
+        
+        return torch.stack([roll, pitch, yaw], dim=-1)
 
     def _log_imu_debug(self):
         progress_buf = getattr(self, "progress_buf", None)
