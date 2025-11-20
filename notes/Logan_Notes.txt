@@ -1,0 +1,15 @@
+Isaac-Quadcopter-Direct-v0
+
+# Training (with video recording)
+python scripts/reinforcement_learning/skrl/train.py --task=Isaac-Quadcopter-Direct-v0 --video --video_length=500 --video_interval=1000
+
+# 15k steps and onnx
+python scripts/reinforcement_learning/skrl/train.py --task=Isaac-Quadcopter-Direct-v0 --video --video_length=15000 --video_interval=15000 --max_iterations 625 --export_onnx --headless
+
+# Training (basic, no video)
+python scripts/reinforcement_learning/skrl/train.py --task=Isaac-Quadcopter-Direct-v0
+
+# Evaluation/Play (with video recording)
+python scripts/reinforcement_learning/skrl/play.py --task=Isaac-Quadcopter-Direct-v0 --checkpoint=logs\skrl\quadcopter_direct\2025-10-23_13-25-06_ppo_torch\checkpoints\best_agent.pt --video --video_length=500
+
+.\isaaclab.bat -p scripts\reinforcement_learning\skrl\play.py --task=Isaac-Quadcopter-Direct-v0 --checkpoint=logs\skrl\quadcopter_direct\2025-10-23_16-39-10_ppo_torch\exported\policy.onnx --video --video_length=500
