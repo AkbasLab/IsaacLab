@@ -71,7 +71,13 @@ from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
 from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
 
-from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper, export_policy_as_jit, export_policy_as_onnx
+from isaaclab_rl.rsl_rl import (
+    RslRlBaseRunnerCfg,
+    RslRlVecEnvWrapper,
+    export_policy_as_jit,
+    export_policy_as_onnx,
+    export_policy_as_onnx_int8,
+)
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
@@ -171,6 +177,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
     export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
     export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
+    
+    # export quantized INT8 version for embedded deployment (STM32, etc.)
+    try:
+        export_policy_as_onnx_int8(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy_int8.onnx", verbose=True)
+    except ImportError as e:
+        print(f"[Warning] INT8 export skipped: {e}")
+        print("[Info] Install onnxruntime to enable INT8 quantized export: pip install onnxruntime")
+    except Exception as e:
+        print(f"[Warning] INT8 export failed: {e}")
 
     dt = env.unwrapped.step_dt
 

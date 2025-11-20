@@ -39,6 +39,74 @@ def export_policy_as_onnx(
     policy_exporter.export(path, filename)
 
 
+def export_policy_as_onnx_int8(
+    policy: object, path: str, normalizer: object | None = None, filename="policy_int8.onnx", verbose=False
+):
+    """Export policy into a quantized INT8 ONNX file for embedded deployment.
+
+    This function exports the policy to ONNX format with INT8 quantization, reducing model size
+    by ~75% and improving inference speed on embedded systems like STM32 microcontrollers.
+
+    Args:
+        policy: The policy torch module.
+        normalizer: The empirical normalizer module. If None, Identity is used.
+        path: The path to the saving directory.
+        filename: The name of exported quantized ONNX file. Defaults to "policy_int8.onnx".
+        verbose: Whether to print the model summary and quantization info. Defaults to False.
+
+    Raises:
+        ImportError: If onnxruntime is not installed.
+        RuntimeError: If quantization fails.
+    """
+    try:
+        import onnx
+        from onnxruntime.quantization import quantize_dynamic, QuantType
+    except ImportError as e:
+        raise ImportError(
+            "onnxruntime is required for INT8 quantization. Install it with: pip install onnxruntime"
+        ) from e
+
+    if not os.path.exists(path):
+        os.makedirs(path, exist_ok=True)
+
+    # First export as FP32
+    temp_filename = "policy_fp32_temp.onnx"
+    if verbose:
+        print(f"[INT8 Export] Step 1/2: Exporting FP32 ONNX model...")
+    export_policy_as_onnx(policy, path, normalizer, temp_filename, verbose=False)
+
+    # Quantize to INT8
+    model_fp32_path = os.path.join(path, temp_filename)
+    model_int8_path = os.path.join(path, filename)
+
+    if verbose:
+        print(f"[INT8 Export] Step 2/2: Quantizing to INT8...")
+
+    try:
+        quantize_dynamic(
+            model_fp32_path,
+            model_int8_path,
+            weight_type=QuantType.QInt8,  # Use 8-bit signed integer quantization
+            optimize_model=True,  # Apply ONNX optimizations
+        )
+    except Exception as e:
+        # Clean up temp file even if quantization fails
+        if os.path.exists(model_fp32_path):
+            os.remove(model_fp32_path)
+        raise RuntimeError(f"INT8 quantization failed: {e}") from e
+
+    # Remove temporary FP32 file
+    if os.path.exists(model_fp32_path):
+        os.remove(model_fp32_path)
+
+    if verbose:
+        # Get file sizes for comparison
+        int8_size = os.path.getsize(model_int8_path) / 1024  # KB
+        print(f"[INT8 Export] Quantized model saved to: {model_int8_path}")
+        print(f"[INT8 Export] Model size: {int8_size:.2f} KB")
+        print(f"[INT8 Export] Ready for embedded deployment (STM32, etc.)")
+
+
 """
 Helper Classes - Private.
 """
