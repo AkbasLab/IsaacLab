@@ -50,9 +50,9 @@ class QuadcopterEnvWindow(BaseEnvWindow):
 class QuadcopterEnvCfg(DirectRLEnvCfg):
     # env
     episode_length_s = 10.0
-    decimation = 2
+    decimation = 1  # 100 Hz control for Crazyflie compatibility
     action_space = 4
-    observation_space = 12
+    observation_space = 9  # IMU-only: lin_acc[3], ang_vel[3], euler[3]
     state_space = 0
     debug_vis = True
 
@@ -94,6 +94,13 @@ class QuadcopterEnvCfg(DirectRLEnvCfg):
     thrust_to_weight = 1.9
     moment_scale = 0.01
 
+    # domain randomization (learning-to-fly style)
+    domain_randomization = True  # Enable for robust sim-to-real transfer
+    mass_randomization_range = (0.8, 1.2)  # ±20%
+    inertia_randomization_range = (0.7, 1.3)  # ±30%
+    force_disturbance_std = 0.1  # 10% of weight
+    torque_disturbance_std = 0.005  # Nm
+
     # reward scales
     lin_vel_reward_scale = -0.05
     ang_vel_reward_scale = -0.01
@@ -110,8 +117,19 @@ class QuadcopterEnv(DirectRLEnv):
         self._actions = torch.zeros(self.num_envs, gym.spaces.flatdim(self.single_action_space), device=self.device)
         self._thrust = torch.zeros(self.num_envs, 1, 3, device=self.device)
         self._moment = torch.zeros(self.num_envs, 1, 3, device=self.device)
-        # Goal position
+        # Goal position (for reward only, not in observation)
         self._desired_pos_w = torch.zeros(self.num_envs, 3, device=self.device)
+        
+        # Motor dynamics (Crazyflie parameters)
+        self._motor_rpm_delayed = torch.zeros(self.num_envs, 4, device=self.device)
+        self._motor_time_constant = 0.15  # seconds (from learning-to-fly)
+        
+        # Battery model
+        self._battery_voltage = torch.ones(self.num_envs, device=self.device) * 3.7
+        self._battery_discharge_rate = 0.00005  # V per step
+        
+        # Attitude noise for observation
+        self._attitude_noise_std = 0.001  # rad (~0.057 degrees)
 
         # Logging
         self._episode_sums = {
@@ -149,25 +167,65 @@ class QuadcopterEnv(DirectRLEnv):
 
     def _pre_physics_step(self, actions: torch.Tensor):
         self._actions = actions.clone().clamp(-1.0, 1.0)
-        self._thrust[:, 0, 2] = self.cfg.thrust_to_weight * self._robot_weight * (self._actions[:, 0] + 1.0) / 2.0
-        self._moment[:, 0, :] = self.cfg.moment_scale * self._actions[:, 1:]
+        
+        # First-order motor lag (tau = 0.15s)
+        dt = self.step_dt
+        alpha = dt / (self._motor_time_constant + dt)
+        self._motor_rpm_delayed = (
+            alpha * self._actions + (1 - alpha) * self._motor_rpm_delayed
+        )
+        
+        # Battery discharge
+        self._battery_voltage -= self._battery_discharge_rate
+        self._battery_voltage.clamp_(min=3.0, max=4.2)
+        
+        # Voltage-dependent thrust scaling (thrust ~ voltage^2)
+        voltage_scale = (self._battery_voltage / 3.7) ** 2
+        
+        # Convert delayed actions to thrust/moment
+        thrust_normalized = (self._motor_rpm_delayed[:, 0] + 1.0) / 2.0
+        self._thrust[:, 0, 2] = (
+            self.cfg.thrust_to_weight * self._robot_weight * thrust_normalized * voltage_scale
+        )
+        self._moment[:, 0, :] = self.cfg.moment_scale * self._motor_rpm_delayed[:, 1:]
+        
+        # Domain randomization: random disturbances (learning-to-fly style)
+        if hasattr(self.cfg, 'domain_randomization') and self.cfg.domain_randomization:
+            # Force disturbances: ±10% of weight
+            force_disturbance = torch.randn(self.num_envs, 3, device=self.device) * 0.1 * self._robot_weight.unsqueeze(1)
+            self._thrust[:, 0, :] += force_disturbance
+            
+            # Torque disturbances: ±0.005 Nm
+            torque_disturbance = torch.randn(self.num_envs, 3, device=self.device) * 0.005
+            self._moment[:, 0, :] += torque_disturbance
 
     def _apply_action(self):
         self._robot.set_external_force_and_torque(self._thrust, self._moment, body_ids=self._body_id)
 
     def _get_observations(self) -> dict:
-        desired_pos_b, _ = subtract_frame_transforms(
-            self._robot.data.root_pos_w, self._robot.data.root_quat_w, self._desired_pos_w
-        )
-        obs = torch.cat(
-            [
-                self._robot.data.root_lin_vel_b,
-                self._robot.data.root_ang_vel_b,
-                self._robot.data.projected_gravity_b,
-                desired_pos_b,
-            ],
-            dim=-1,
-        )
+        # Use IMU sensor data with realistic noise (matches Crazyflie BMI088)
+        imu_data = self._imu.data
+        
+        # Linear acceleration (body frame, m/s²)
+        lin_acc_b = imu_data.lin_acc_b.clone()
+        if self._imu_has_lin_acc_noise:
+            lin_acc_b += self._imu_lin_acc_noise
+        
+        # Angular velocity (body frame, rad/s)
+        ang_vel_b = imu_data.ang_vel_b.clone()
+        if self._imu_has_ang_vel_noise:
+            ang_vel_b += self._imu_ang_vel_noise
+        
+        # Euler angles from quaternion (rad) - matches Crazyflie attitude estimator
+        quat_w = self._robot.data.root_quat_w
+        euler_b = self._quat_to_euler_xyz(quat_w)
+        
+        # Add attitude drift noise (complementary filter drift)
+        if hasattr(self, '_attitude_noise_std'):
+            euler_b += torch.randn_like(euler_b) * self._attitude_noise_std
+        
+        # Concatenate: 9D observation vector
+        obs = torch.cat([lin_acc_b, ang_vel_b, euler_b], dim=-1)
         observations = {"policy": obs}
         return observations
 
@@ -224,6 +282,24 @@ class QuadcopterEnv(DirectRLEnv):
         self._desired_pos_w[env_ids, :2] = torch.zeros_like(self._desired_pos_w[env_ids, :2]).uniform_(-2.0, 2.0)
         self._desired_pos_w[env_ids, :2] += self._terrain.env_origins[env_ids, :2]
         self._desired_pos_w[env_ids, 2] = torch.zeros_like(self._desired_pos_w[env_ids, 2]).uniform_(0.5, 1.5)
+        
+        # Reset motor and battery states
+        self._motor_rpm_delayed[env_ids] = 0.0
+        self._battery_voltage[env_ids] = torch.rand(len(env_ids), device=self.device) * 0.5 + 3.7  # 3.7-4.2V
+        
+        # Domain randomization: mass/inertia (±20% from learning-to-fly)
+        if hasattr(self.cfg, 'domain_randomization') and self.cfg.domain_randomization:
+            mass_scale = torch.rand(len(env_ids), device=self.device) * 0.4 + 0.8  # [0.8, 1.2]
+            self._robot_mass[env_ids] = self._robot_mass_nominal * mass_scale
+            
+            # Inertia tensor randomization (±30%)
+            inertia_scale = torch.rand(len(env_ids), 3, device=self.device) * 0.6 + 0.7  # [0.7, 1.3]
+            self._robot_inertia[env_ids] = self._robot_inertia_nominal * inertia_scale
+            
+            # Update physics (requires setting mass properties)
+            # Note: IsaacLab doesn't support runtime mass changes directly
+            # This is a placeholder - actual implementation would use set_mass_properties API
+        
         # Reset robot state
         joint_pos = self._robot.data.default_joint_pos[env_ids]
         joint_vel = self._robot.data.default_joint_vel[env_ids]
@@ -251,3 +327,34 @@ class QuadcopterEnv(DirectRLEnv):
     def _debug_vis_callback(self, event):
         # update the markers
         self.goal_pos_visualizer.visualize(self._desired_pos_w)
+    
+    def _quat_to_euler_xyz(self, quat: torch.Tensor) -> torch.Tensor:
+        """Convert quaternion (w,x,y,z) to Euler angles (roll, pitch, yaw) in radians.
+        
+        Args:
+            quat: Quaternion tensor of shape (N, 4) in (w, x, y, z) format
+            
+        Returns:
+            Euler angles tensor of shape (N, 3) as (roll, pitch, yaw)
+        """
+        w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+        
+        # Roll (x-axis rotation)
+        sinr_cosp = 2 * (w * x + y * z)
+        cosr_cosp = 1 - 2 * (x * x + y * y)
+        roll = torch.atan2(sinr_cosp, cosr_cosp)
+        
+        # Pitch (y-axis rotation)
+        sinp = 2 * (w * y - z * x)
+        pitch = torch.where(
+            torch.abs(sinp) >= 1,
+            torch.sign(sinp) * torch.pi / 2,
+            torch.asin(sinp)
+        )
+        
+        # Yaw (z-axis rotation)
+        siny_cosp = 2 * (w * z + x * y)
+        cosy_cosp = 1 - 2 * (y * y + z * z)
+        yaw = torch.atan2(siny_cosp, cosy_cosp)
+        
+        return torch.stack([roll, pitch, yaw], dim=-1)
