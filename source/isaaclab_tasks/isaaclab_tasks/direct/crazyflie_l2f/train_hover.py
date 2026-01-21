@@ -355,23 +355,26 @@ class CrazyflieL2FEnv(DirectRLEnv):
     def _pre_physics_step(self, actions: torch.Tensor):
         """Process actions using L2F motor model.
         
-        L2F Motor Model:
+        FIRMWARE-COMPATIBLE Motor Model (no hover bias):
         1. Actions are normalized RPM commands in [-1, 1]
-        2. Add hover bias so action=0 means hover thrust
-        3. Map to target RPM: target_rpm = (biased_action + 1) / 2 * max_rpm
-        4. First-order dynamics: rpm += alpha * (target_rpm - rpm)
-        5. Thrust per motor: F = k_f * rpm²
-        6. Compute body forces/torques via mixer
+        2. Map DIRECTLY to target RPM: target_rpm = (action + 1) / 2 * max_rpm
+        3. First-order dynamics: rpm += alpha * (target_rpm - rpm)
+        4. Thrust per motor: F = k_f * rpm²
+        5. Compute body forces/torques via mixer
+        
+        CRITICAL: The firmware does NOT add any hover bias. Actions in [-1, 1]
+        map directly to [0, MAX_RPM]. For hover, policy must output ~0.334.
+        This matches firmware's rl_tools_controller.c:
+            float a_pp = (action_output[i] + 1)/2;
+            float des_rpm = (MAX_RPM - MIN_RPM) * a_pp + MIN_RPM;
         """
         # Store and clamp actions
         self._actions = actions.clone().clamp(-1.0, 1.0)
         
-        # Add hover bias: action=0 -> hover, action output is correction from hover
-        # This makes learning easier as the policy only needs to learn small corrections
-        biased_actions = (self._actions + self._hover_action).clamp(-1.0, 1.0)
-        
-        # Map to target RPM
-        target_rpm = (biased_actions + 1.0) / 2.0 * self._max_rpm
+        # Map DIRECTLY to target RPM - NO hover bias!
+        # This matches the firmware's interpretation exactly.
+        # At hover, policy should learn to output ~0.334 (hover_action)
+        target_rpm = (self._actions + 1.0) / 2.0 * self._max_rpm
         
         # Apply first-order motor dynamics
         self._rpm_state = self._rpm_state + self._motor_alpha * (target_rpm - self._rpm_state)
@@ -436,11 +439,17 @@ class CrazyflieL2FEnv(DirectRLEnv):
     def _get_observations(self) -> dict:
         """Construct observations matching L2F firmware format (146 dims).
         
+        CRITICAL: Observations MUST match firmware's update_state() exactly!
+        
+        Firmware clips observations:
+        - Position: ±0.5m (pos_distance_limit_position)
+        - Velocity: ±2.0 m/s (vel_distance_limit_position)
+        
         Layout:
-        - [0:3]   Position relative to target
+        - [0:3]   Position error (clipped to ±0.5m)
         - [3:12]  Rotation matrix (9 elements, row-major)
-        - [12:15] Linear velocity in world frame
-        - [15:18] Angular velocity in body frame
+        - [12:15] Linear velocity (clipped to ±2.0 m/s)
+        - [15:18] Angular velocity in body frame (radians/s)
         - [18:146] Action history (32 * 4 = 128)
         """
         # Get state
@@ -450,9 +459,18 @@ class CrazyflieL2FEnv(DirectRLEnv):
         ang_vel_b = self._robot.data.root_ang_vel_b
         
         # Position relative to target (target is at init_target_height above ground)
+        # Firmware computes: state->position - target_pos
         target_pos = self._terrain.env_origins.clone()
         target_pos[:, 2] += self.cfg.init_target_height
         pos_error = pos_w - target_pos
+        
+        # CRITICAL: Clip position error to match firmware
+        # Firmware: clip(pos_error, -POS_DISTANCE_LIMIT, POS_DISTANCE_LIMIT)
+        pos_error_clipped = pos_error.clamp(-0.5, 0.5)
+        
+        # CRITICAL: Clip velocity to match firmware
+        # Firmware: clip(velocity_error, -VEL_DISTANCE_LIMIT, VEL_DISTANCE_LIMIT)
+        lin_vel_clipped = lin_vel_w.clamp(-2.0, 2.0)
         
         # Rotation matrix
         rot_matrix = self._quat_to_rotation_matrix(quat_w)
@@ -462,9 +480,9 @@ class CrazyflieL2FEnv(DirectRLEnv):
         
         # Concatenate (146 dims total)
         obs = torch.cat([
-            pos_error,           # 3
+            pos_error_clipped,   # 3 (clipped to ±0.5m)
             rot_matrix,          # 9
-            lin_vel_w,           # 3
+            lin_vel_clipped,     # 3 (clipped to ±2.0 m/s)
             ang_vel_b,           # 3
             action_history_flat, # 128
         ], dim=-1)
@@ -508,9 +526,11 @@ class CrazyflieL2FEnv(DirectRLEnv):
         # Angular velocity cost: ||ang_vel||²
         angular_velocity_cost = (ang_vel ** 2).sum(dim=-1)
         
-        # Action cost: ||action||² (since hover bias is applied, action=0 is optimal)
-        # Penalize deviations from 0 (which means hover after bias)
-        action_cost = (self._actions ** 2).sum(dim=-1)
+        # Action cost: penalize deviation from hover action
+        # Since we removed the hover bias, optimal action is now ~0.334 (hover_action)
+        # This encourages the policy to output actions near the hover point
+        action_deviation = self._actions - self._hover_action
+        action_cost = (action_deviation ** 2).sum(dim=-1)
         
         # Weighted sum
         weighted_cost = (
@@ -658,9 +678,11 @@ class CrazyflieL2FEnv(DirectRLEnv):
         # Initialize motor state to hover RPM (so drone is already flying)
         self._rpm_state[env_ids] = self._hover_rpm
         
-        # Initialize action history to 0 (hover bias is applied automatically)
-        self._action_history[env_ids] = 0.0
-        self._actions[env_ids] = 0.0
+        # Initialize action history to hover action (not 0!)
+        # Since we removed hover bias, the policy must output hover_action for hover
+        # Action history should reflect this initial hover state
+        self._action_history[env_ids] = self._hover_action
+        self._actions[env_ids] = self._hover_action
         
         # Sample disturbances
         if cfg.enable_disturbance:
@@ -700,7 +722,12 @@ class L2FActorNetwork(nn.Module):
     Architecture: 146 -> 64 (tanh) -> 64 (tanh) -> 4 (tanh)
     
     This MUST match the firmware expectation for successful deployment.
+    
+    IMPORTANT: Output is biased toward hover action (~0.334) at initialization.
     """
+    
+    # Hover action value (computed from physics)
+    HOVER_ACTION = 2.0 * math.sqrt(0.027 * 9.81 / (4 * 3.16e-10)) / 21702.0 - 1.0
     
     def __init__(self, obs_dim: int = 146, hidden_dim: int = 64, action_dim: int = 4, init_std: float = 0.3):
         super().__init__()
@@ -709,19 +736,23 @@ class L2FActorNetwork(nn.Module):
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, action_dim)
         
-        # Learnable log std
+        # Learnable log std - start with small std for stable learning
         self.log_std = nn.Parameter(torch.ones(action_dim) * math.log(init_std))
         
-        # Initialize weights
+        # Initialize weights with hover action bias
         self._init_weights()
     
     def _init_weights(self):
         for m in [self.fc1, self.fc2]:
             nn.init.orthogonal_(m.weight, gain=1.0)
             nn.init.zeros_(m.bias)
-        # Smaller gain for output layer
+        # Output layer: small weights, bias toward hover action
+        # We want tanh(fc3(x)) ≈ HOVER_ACTION when x ≈ 0
+        # Since atanh(0.334) ≈ 0.347, set bias to achieve this
         nn.init.orthogonal_(self.fc3.weight, gain=0.01)
-        nn.init.zeros_(self.fc3.bias)
+        # Bias the output toward hover action
+        hover_bias = math.atanh(max(-0.99, min(0.99, self.HOVER_ACTION)))
+        nn.init.constant_(self.fc3.bias, hover_bias)
     
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         """Forward pass returning mean actions bounded to [-1, 1]."""

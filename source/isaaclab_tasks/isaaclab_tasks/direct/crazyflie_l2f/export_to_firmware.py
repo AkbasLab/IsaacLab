@@ -230,13 +230,59 @@ namespace rl_tools::checkpoint::actor {{
 ''')
     
     # Observation namespace for testing
-    # Generate zero bytes for 146 floats (146 * 4 = 584 bytes)
-    obs_bytes = ', '.join(['0'] * (146 * 4))
+    # CRITICAL: Create a proper test observation that represents hover state
+    # The observation at hover is:
+    # - Position error: [0, 0, 0] (at target)
+    # - Rotation matrix: identity [1,0,0,0,1,0,0,0,1] 
+    # - Linear velocity: [0, 0, 0]
+    # - Angular velocity: [0, 0, 0]
+    # - Action history: all hover actions (32 * 4 = 128 values)
     
+    # Build test observation array
+    test_obs = np.zeros(146, dtype=np.float32)
+    # Position error: already 0
+    # Rotation matrix (identity): [1,0,0, 0,1,0, 0,0,1]
+    test_obs[3] = 1.0   # r00
+    test_obs[7] = 1.0   # r11
+    test_obs[11] = 1.0  # r22
+    # Linear velocity: already 0
+    # Angular velocity: already 0
+    # Action history: fill with hover action (~0.334)
+    hover_action = 2.0 * np.sqrt(0.027 * 9.81 / (4 * 3.16e-10)) / 21702.0 - 1.0
+    test_obs[18:146] = hover_action
+    
+    # If normalization is baked in, we need to apply it to test_obs
+    # Because the network weights already include normalization,
+    # but the test runs on raw observation
+    # Actually, the test in firmware does: evaluate(model, test_obs, output)
+    # With normalization baked in, test_obs should be raw (not normalized)
+    # So we use test_obs as-is
+    
+    obs_bytes = float_to_bytes(test_obs)
+    obs_c_array = bytes_to_c_array_inline(obs_bytes)
+    
+    # Compute expected action by running the policy with normalization baked in
+    # Use the layers_data which already has normalization baked into layer 0
+    with torch.no_grad():
+        test_obs_tensor = torch.from_numpy(test_obs).unsqueeze(0).float()
+        x = test_obs_tensor
+        for i, (weights, biases) in enumerate(layers_data):
+            weights_t = torch.from_numpy(weights).float()
+            biases_t = torch.from_numpy(biases).float()
+            x = x @ weights_t.T + biases_t
+            x = torch.tanh(x)
+        expected_action = x.squeeze(0).numpy().astype(np.float32)
+    
+    action_bytes = float_to_bytes(expected_action)
+    action_c_array = bytes_to_c_array_inline(action_bytes)
+    
+    print(f"  Test observation: pos_err=[0,0,0], rot=I, vel=[0,0,0], ang_vel=[0,0,0]")
+    print(f"  Test expected action: {expected_action}")
+
     content.append(f'''#include <rl_tools/containers.h>
 namespace rl_tools::checkpoint::observation {{
     static_assert(sizeof(unsigned char) == 1);
-    alignas(float) const unsigned char memory[] = {{{obs_bytes}}};
+    alignas(float) const unsigned char memory[] = {{{obs_c_array}}};
     using CONTAINER_SPEC = RL_TOOLS_NAMESPACE_WRAPPER ::rl_tools::matrix::Specification<float, unsigned long, 1, 146, RL_TOOLS_NAMESPACE_WRAPPER ::rl_tools::matrix::layouts::RowMajorAlignment<unsigned long, 1>>;
     using CONTAINER_TYPE = RL_TOOLS_NAMESPACE_WRAPPER ::rl_tools::MatrixDynamic<CONTAINER_SPEC>;
     const CONTAINER_TYPE container = {{(float*)memory}}; 
@@ -245,7 +291,7 @@ namespace rl_tools::checkpoint::observation {{
 #include <rl_tools/containers.h>
 namespace rl_tools::checkpoint::action {{
     static_assert(sizeof(unsigned char) == 1);
-    alignas(float) const unsigned char memory[] = {{0, 0, 128, 63, 0, 0, 128, 63, 0, 0, 128, 63, 0, 0, 128, 63}};
+    alignas(float) const unsigned char memory[] = {{{action_c_array}}};
     using CONTAINER_SPEC = RL_TOOLS_NAMESPACE_WRAPPER ::rl_tools::matrix::Specification<float, unsigned long, 1, 4, RL_TOOLS_NAMESPACE_WRAPPER ::rl_tools::matrix::layouts::RowMajorAlignment<unsigned long, 1>>;
     using CONTAINER_TYPE = RL_TOOLS_NAMESPACE_WRAPPER ::rl_tools::MatrixDynamic<CONTAINER_SPEC>;
     const CONTAINER_TYPE container = {{(float*)memory}}; 
