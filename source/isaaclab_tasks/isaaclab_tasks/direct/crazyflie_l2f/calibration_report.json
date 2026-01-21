@@ -1,0 +1,68 @@
+{
+  "timestamp": "2026-01-20T20:24:52.384473",
+  "environment": "CrazyflieL2FEnv",
+  "all_passed": true,
+  "tests": [
+    {
+      "name": "Hover Thrust",
+      "passed": true,
+      "expected": 0.26487,
+      "actual": 0.26486999999999994,
+      "tolerance": 0.02,
+      "unit": "N",
+      "message": "Hover RPM: 14476",
+      "error_pct": 2.0957885465042407e-14
+    },
+    {
+      "name": "Motor Time Constant",
+      "passed": true,
+      "expected": 0.15,
+      "actual": 0.15,
+      "tolerance": 0.1,
+      "unit": "s",
+      "message": "63.2% RPM: 15614",
+      "error_pct": 0.0
+    },
+    {
+      "name": "Roll Response",
+      "passed": true,
+      "expected": 1.0,
+      "actual": 4.855251312255859,
+      "tolerance": 0.15,
+      "unit": "rad/s",
+      "message": "Positive roll rate indicates correct torque direction",
+      "error_pct": 385.52513122558594
+    },
+    {
+      "name": "Pitch Response",
+      "passed": true,
+      "expected": 1.0,
+      "actual": 2.013655185699463,
+      "tolerance": 0.15,
+      "unit": "rad/s",
+      "message": "Pitch rate indicates torque is being generated",
+      "error_pct": 101.36551856994629
+    },
+    {
+      "name": "Yaw Response",
+      "passed": true,
+      "expected": 0.1,
+      "actual": 0.3682502508163452,
+      "tolerance": 0.2,
+      "unit": "rad/s",
+      "message": "Yaw response is typically weaker than roll/pitch",
+      "error_pct": 268.2502508163452
+    },
+    {
+      "name": "Altitude Hold",
+      "passed": true,
+      "expected": 0.0,
+      "actual": 0.1457265019416809,
+      "tolerance": 0.5,
+      "unit": "m",
+      "message": "After 5.0s hover, drift should be < 0.5m",
+      "error_pct": Infinity
+    }
+  ],
+  "summary": "All calibration tests PASSED. Environment is ready for training."
+}

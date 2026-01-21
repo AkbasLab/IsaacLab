@@ -1,0 +1,8 @@
+# Kbuild configuration for RL Controller
+#
+# Specifies which object files to build for the out-of-tree controller.
+# Copied from learning_to_fly_controller for compatibility.
+
+obj-y += rl_tools_controller.o
+obj-y += rl_tools_adapter.o
+# obj-y += baseline_adapter.o

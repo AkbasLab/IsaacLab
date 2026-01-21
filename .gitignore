@@ -79,3 +79,4 @@ tests/
 # Misc
 /2.7.0+cu128
 
+/.venv
