@@ -304,14 +304,22 @@ def export_from_checkpoint_file(
         if include_normalizer:
             if 'obs_mean' in checkpoint:
                 obs_mean = checkpoint['obs_mean'].numpy()
-                obs_std = checkpoint['obs_std'].numpy()
+                # Handle both obs_std and obs_var formats
+                if 'obs_std' in checkpoint:
+                    obs_std = checkpoint['obs_std'].numpy()
+                elif 'obs_var' in checkpoint:
+                    obs_std = np.sqrt(checkpoint['obs_var'].numpy())
             elif 'running_mean_std' in checkpoint:
                 rms = checkpoint['running_mean_std']
                 obs_mean = rms['mean'].numpy()
                 obs_std = np.sqrt(rms['var'].numpy())
         
         # Create a dummy network and load weights
-        from .networks import L2FActorNetwork
+        # Handle import for both module and script execution
+        try:
+            from .networks import L2FActorNetwork
+        except ImportError:
+            from networks import L2FActorNetwork
         actor = L2FActorNetwork()
         
         # Filter actor weights from state dict
@@ -319,10 +327,11 @@ def export_from_checkpoint_file(
         for k, v in state_dict.items():
             if k.startswith('actor.'):
                 actor_state[k.replace('actor.', '')] = v
-            elif not k.startswith('critic.') and not k.startswith('std'):
+            elif not k.startswith('critic.'):
+                # Include log_std and fc layers
                 actor_state[k] = v
         
-        actor.load_state_dict(actor_state)
+        actor.load_state_dict(actor_state, strict=False)
     else:
         # Direct model
         actor = checkpoint
