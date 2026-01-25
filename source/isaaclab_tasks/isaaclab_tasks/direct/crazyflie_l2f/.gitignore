@@ -33,3 +33,5 @@ Thumbs.db
 # Logs
 *.log
 logs/
+checkpoints/
+checkpoints_nav/
