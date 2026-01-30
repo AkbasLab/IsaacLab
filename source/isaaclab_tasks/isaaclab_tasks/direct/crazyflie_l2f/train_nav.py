@@ -1,26 +1,28 @@
 #!/usr/bin/env python3
 """
-Crazyflie L2F Navigation Training Script - Two-Phase Approach
+Crazyflie L2F Navigation Training Script - Single-Phase Approach
 
-This script trains a Crazyflie 2.1 navigation policy that:
-1. PHASE 1 (Hover): First stabilizes at target height for 3 seconds
-2. PHASE 2 (Navigate): Then navigates horizontally to target XY position
+This script trains a Crazyflie 2.1 navigation policy that flies to random
+goal positions. Key improvements over the two-phase approach:
 
-The policy builds on hover skills by requiring stable flight before rewarding
-horizontal movement. This curriculum helps the drone learn to fly safely.
+1. SINGLE PHASE: No hover→navigate transition - learns unified navigation
+2. RANDOM GOALS: Goals sampled on reset, larger range (±1m XY, 0.5-1.5m Z)
+3. UNIFIED REWARD: Tanh-based distance reward (proven in quadcopter_env.py)
+4. L2F COMPATIBLE: Same 146-dim observation for firmware export
 
-KEY DESIGN DECISIONS:
-1. Same observation space as hover (146 dims) for L2F compatibility
-2. Two-phase reward: hover first, then navigate
-3. Target position changes during episode (after hover phase)
-4. Builds on hover policy architecture
+The observation space matches what's available on the real Crazyflie:
+- Position error (from Flow Deck + state estimator)
+- Rotation matrix (from IMU)
+- Velocity (from Flow Deck + state estimator)
+- Angular velocity (from gyroscope)
+- Action history (maintained in firmware)
 
 Usage:
     # Training mode
-    python train_nav.py --num_envs 4096 --max_iterations 1000 --headless
+    python train_nav_v2.py --num_envs 4096 --max_iterations 2000 --headless
     
     # Play mode with trained checkpoint
-    python train_nav.py --play --checkpoint checkpoints_nav/best_model.pt
+    python train_nav_v2.py --play --checkpoint checkpoints_nav_v2/best_model.pt
 """
 
 from __future__ import annotations
@@ -41,24 +43,25 @@ from isaaclab.app import AppLauncher
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Crazyflie L2F Navigation Training")
+    parser = argparse.ArgumentParser(description="Crazyflie L2F Navigation Training V2")
     
     # Mode selection
     parser.add_argument("--play", action="store_true", help="Run in play mode with trained model")
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint for play mode")
     parser.add_argument("--resume_from", type=str, default=None, 
-                        help="Resume training from checkpoint (e.g., hover checkpoint for curriculum learning)")
+                        help="Resume training from checkpoint (e.g., hover checkpoint)")
     
     # Training parameters  
     parser.add_argument("--num_envs", type=int, default=4096, help="Number of environments")
-    parser.add_argument("--max_iterations", type=int, default=1000, help="Maximum training iterations")
-    parser.add_argument("--save_interval", type=int, default=50, help="Save checkpoint every N iterations")
+    parser.add_argument("--max_iterations", type=int, default=2000, help="Maximum training iterations")
+    parser.add_argument("--save_interval", type=int, default=100, help="Save checkpoint every N iterations")
     
     # Navigation parameters
-    parser.add_argument("--hover_time", type=float, default=3.0, help="Seconds to hover before navigation")
-    parser.add_argument("--nav_distance", type=float, default=0.5, help="Max XY navigation distance (m)")
+    parser.add_argument("--goal_xy_range", type=float, default=1.0, help="Max XY goal distance from origin (m)")
+    parser.add_argument("--goal_z_min", type=float, default=0.5, help="Min goal height (m)")
+    parser.add_argument("--goal_z_max", type=float, default=1.5, help="Max goal height (m)")
     
-    # Hyperparameters (tuned for quadrotor)
+    # Hyperparameters
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
     parser.add_argument("--batch_size", type=int, default=4096, help="Batch size")
@@ -97,41 +100,34 @@ from crazyflie_21_cfg import CRAZYFLIE_21_CFG, CrazyflieL2FParams
 class L2FConstants:
     """Physical parameters matching learning-to-fly exactly."""
     
-    # Mass and geometry
     MASS = 0.027  # kg (27g)
     ARM_LENGTH = 0.028  # m (28mm)
     GRAVITY = 9.81  # m/s²
     
-    # Inertia (diagonal)
-    IXX = 3.85e-6    # kg·m²
-    IYY = 3.85e-6    # kg·m²
-    IZZ = 5.9675e-6  # kg·m²
+    IXX = 3.85e-6
+    IYY = 3.85e-6
+    IZZ = 5.9675e-6
     
-    # Motor model
     THRUST_COEFFICIENT = 3.16e-10  # N/RPM²
     TORQUE_COEFFICIENT = 0.005964552  # Nm/N
     RPM_MIN = 0.0
     RPM_MAX = 21702.0
     MOTOR_TIME_CONSTANT = 0.15  # seconds
     
-    # Rotor positions (X-config)
     ROTOR_POSITIONS = [
-        (0.028, -0.028, 0.0),   # M1
-        (-0.028, -0.028, 0.0),  # M2
-        (-0.028, 0.028, 0.0),   # M3
-        (0.028, 0.028, 0.0),    # M4
+        (0.028, -0.028, 0.0),
+        (-0.028, -0.028, 0.0),
+        (-0.028, 0.028, 0.0),
+        (0.028, 0.028, 0.0),
     ]
     
-    # Rotor yaw directions: -1=CW, +1=CCW
     ROTOR_YAW_DIRS = [-1.0, 1.0, -1.0, 1.0]
     
-    # Computed hover RPM
     @classmethod
     def hover_rpm(cls) -> float:
         thrust_per_motor = cls.MASS * cls.GRAVITY / 4.0
         return math.sqrt(thrust_per_motor / cls.THRUST_COEFFICIENT)
     
-    # Hover action in normalized space [-1, 1]
     @classmethod
     def hover_action(cls) -> float:
         return 2.0 * cls.hover_rpm() / cls.RPM_MAX - 1.0
@@ -142,14 +138,14 @@ class L2FConstants:
 # ==============================================================================
 
 @configclass
-class CrazyflieNavEnvCfg(DirectRLEnvCfg):
-    """Configuration for Crazyflie navigation environment with two-phase learning."""
+class CrazyflieNavV2EnvCfg(DirectRLEnvCfg):
+    """Configuration for single-phase Crazyflie navigation environment."""
     
-    # Episode settings - longer for navigation
-    episode_length_s = 10.0  # 3s hover + 7s navigation
+    # Episode settings
+    episode_length_s = 10.0
     decimation = 1  # Control at physics rate (100 Hz)
     
-    # Spaces - CRITICAL: Must match L2F exactly (same as hover)
+    # Spaces - MUST match L2F exactly
     observation_space = 146
     action_space = 4
     state_space = 0
@@ -183,74 +179,52 @@ class CrazyflieNavEnvCfg(DirectRLEnvCfg):
     )
     
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=4096, env_spacing=2.5, replicate_physics=True
+        num_envs=4096, env_spacing=4.0, replicate_physics=True
     )
     
-    # Robot - use custom Crazyflie 2.1 with L2F parameters
     robot: ArticulationCfg = CRAZYFLIE_21_CFG.replace(
         prim_path="/World/envs/env_.*/Robot",
     )
     
-    # === PHASE 1: HOVER PARAMETERS ===
-    hover_time = 3.0  # Seconds to hover before navigation phase
-    init_target_height = 1.0  # m - target hover height
+    # === GOAL SAMPLING ===
+    goal_xy_range = 1.0  # Goals within ±1m of spawn in XY
+    goal_z_min = 0.5     # Min goal height
+    goal_z_max = 1.5     # Max goal height
     
-    # Hover reward weights (tuned for smooth sim-to-real transfer)
-    hover_position_weight = 50.0
-    hover_height_weight = 20.0
-    hover_orientation_weight = 30.0
-    hover_velocity_weight = 30.0      # INCREASED from 10 - penalize fast movements
-    hover_angular_velocity_weight = 15.0  # INCREASED from 2 - penalize wobbling
-    hover_action_weight = 0.01
-    hover_action_rate_weight = 20.0   # NEW - penalize rapid action changes
+    # === SPAWN CONFIGURATION ===
+    # Spawn near center, let goal be anywhere in range
+    spawn_xy_range = 0.3  # Spawn within ±0.3m of env origin
+    spawn_z = 1.0         # Spawn at 1m height
+    spawn_vel_range = 0.1  # Small initial velocity perturbation
+    spawn_ang_range = 0.05  # Small angular perturbation
     
-    # Hover stability thresholds (must meet these to advance to phase 2)
-    hover_xy_threshold = 0.15  # m - must be within 15cm of target XY
-    hover_z_threshold = 0.15   # m - must be within 15cm of target height
-    hover_velocity_threshold = 0.3  # m/s - must be relatively stationary
-    hover_stable_steps_required = 20  # Consecutive stable steps needed (was 50)
+    # === REWARD WEIGHTS (inspired by quadcopter_env.py) ===
+    # Distance to goal (primary objective)
+    distance_reward_scale = 15.0  # Positive reward for being close
+    distance_tanh_scale = 0.8     # Tanh falloff parameter
     
-    # === PHASE 2: NAVIGATION PARAMETERS ===
-    nav_distance_max = 0.5  # m - max XY distance for navigation targets
-    nav_height_variation = 0.0  # m - keep same height during navigation (for now)
+    # Reaching bonus
+    reaching_threshold = 0.1  # m - considered "reached" if within 10cm
+    reaching_bonus = 5.0      # One-time bonus for reaching goal
     
-    # Navigation reward weights (tuned for smooth sim-to-real transfer)
-    nav_progress_weight = 10.0  # Reward for moving toward target
-    nav_position_weight = 30.0  # Reward for reaching target
-    nav_orientation_weight = 20.0
-    nav_velocity_weight = 15.0          # INCREASED from 5 - don't rush
-    nav_angular_velocity_weight = 10.0  # INCREASED from 2 - stay level
-    nav_action_weight = 0.01
-    nav_action_rate_weight = 15.0       # NEW - smooth action changes
-    nav_reaching_bonus = 5.0  # Bonus for reaching target
-    nav_reaching_threshold = 0.1  # m - distance to consider "reached"
+    # Stability penalties (keep drone stable while navigating)
+    lin_vel_penalty = 0.05    # Penalize excessive linear velocity
+    ang_vel_penalty = 0.5     # Penalize excessive angular velocity (INCREASED from 0.01)
+    yaw_rate_penalty = 2.0    # Extra penalty for yaw rate specifically (NEW - prevents spinning)
+    action_rate_penalty = 0.1  # Penalize rapid action changes (smooth control)
     
-    # === SHARED PARAMETERS ===
-    reward_scale = 1.0
-    reward_constant = 2.0
-    reward_action_baseline = 0.334
+    # === TERMINATION THRESHOLDS ===
+    term_xy_threshold = 2.0   # m - terminate if too far from origin
+    term_z_min = 0.1          # m - terminate if too low
+    term_z_max = 2.5          # m - terminate if too high
+    term_tilt_threshold = 1.0  # rad (~57 deg) - terminate if too tilted
+    term_lin_vel_threshold = 3.0  # m/s - terminate if moving too fast
+    term_ang_vel_threshold = 5.0  # rad/s - terminate if spinning too fast (DECREASED from 10.0)
     
-    # Initialization (spawn at hover position)
-    init_height_offset_min = 0.0
-    init_height_offset_max = 0.0
-    init_max_xy_offset = 0.0
-    init_max_angle = 0.0
-    init_max_linear_velocity = 0.0
-    init_max_angular_velocity = 0.0
-    init_guidance_probability = 1.0
-    
-    # Termination thresholds
-    term_xy_threshold = 1.0  # m - wider for navigation
-    term_z_min = 0.3
-    term_z_max = 2.0
-    term_tilt_threshold = 0.7  # rad (~40 deg)
-    term_linear_velocity_threshold = 3.0
-    term_angular_velocity_threshold = 8.0
-    
-    # Domain randomization
+    # === DOMAIN RANDOMIZATION ===
     enable_disturbance = True
-    disturbance_force_std = 0.0132
-    disturbance_torque_std = 2.65e-5
+    disturbance_force_std = 0.0132  # N (mass * g / 20)
+    disturbance_torque_std = 2.65e-5  # Nm
     
     # Action history
     action_history_length = 32
@@ -260,17 +234,16 @@ class CrazyflieNavEnvCfg(DirectRLEnvCfg):
 # Environment Implementation
 # ==============================================================================
 
-class CrazyflieNavEnv(DirectRLEnv):
-    """Crazyflie navigation environment with two-phase learning."""
+class CrazyflieNavV2Env(DirectRLEnv):
+    """Crazyflie navigation environment - single phase, random goals."""
     
-    cfg: CrazyflieNavEnvCfg
+    cfg: CrazyflieNavV2EnvCfg
     
-    def __init__(self, cfg: CrazyflieNavEnvCfg, render_mode: str | None = None, **kwargs):
+    def __init__(self, cfg: CrazyflieNavV2EnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
         
         # Cache physics parameters
         self._mass = L2FConstants.MASS
-        self._arm_length = L2FConstants.ARM_LENGTH
         self._thrust_coef = L2FConstants.THRUST_COEFFICIENT
         self._torque_coef = L2FConstants.TORQUE_COEFFICIENT
         self._motor_tau = L2FConstants.MOTOR_TIME_CONSTANT
@@ -281,10 +254,8 @@ class CrazyflieNavEnv(DirectRLEnv):
         self._hover_action = L2FConstants.hover_action()
         self._dt = cfg.sim.dt
         
-        # Motor dynamics alpha
         self._motor_alpha = min(self._dt / self._motor_tau, 1.0)
         
-        # Rotor geometry tensors
         self._rotor_positions = torch.tensor(
             L2FConstants.ROTOR_POSITIONS, device=self.device, dtype=torch.float32
         )
@@ -292,18 +263,16 @@ class CrazyflieNavEnv(DirectRLEnv):
             L2FConstants.ROTOR_YAW_DIRS, device=self.device, dtype=torch.float32
         )
         
-        # Hover phase tracking
-        self._hover_steps = int(cfg.hover_time / cfg.sim.dt)  # Steps in hover phase
-        self._phase = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)  # 0=hover, 1=nav
-        self._hover_stable_count = torch.zeros(self.num_envs, device=self.device)  # Consecutive stable steps
-        
-        # Navigation target (XY offset from spawn, set after hover phase)
-        self._nav_target = torch.zeros(self.num_envs, 3, device=self.device)
-        
         # State tensors
         self._actions = torch.zeros(self.num_envs, 4, device=self.device)
-        self._prev_actions = torch.zeros(self.num_envs, 4, device=self.device)  # For action rate penalty
+        self._prev_actions = torch.zeros(self.num_envs, 4, device=self.device)
         self._rpm_state = torch.zeros(self.num_envs, 4, device=self.device)
+        
+        # Goal position (world frame)
+        self._goal_pos_w = torch.zeros(self.num_envs, 3, device=self.device)
+        
+        # Track if goal was reached this episode (for one-time bonus)
+        self._goal_reached = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         
         # Force/torque buffers
         self._thrust_body = torch.zeros(self.num_envs, 1, 3, device=self.device)
@@ -320,44 +289,37 @@ class CrazyflieNavEnv(DirectRLEnv):
         
         # Episode statistics
         self._episode_sums = {
-            "hover_reward": torch.zeros(self.num_envs, device=self.device),
-            "nav_reward": torch.zeros(self.num_envs, device=self.device),
+            "distance_reward": torch.zeros(self.num_envs, device=self.device),
+            "reaching_bonus": torch.zeros(self.num_envs, device=self.device),
+            "lin_vel_penalty": torch.zeros(self.num_envs, device=self.device),
+            "ang_vel_penalty": torch.zeros(self.num_envs, device=self.device),
+            "yaw_rate_penalty": torch.zeros(self.num_envs, device=self.device),
+            "action_rate_penalty": torch.zeros(self.num_envs, device=self.device),
             "total_reward": torch.zeros(self.num_envs, device=self.device),
         }
         
-        # Get body ID for force application
         self._body_id = self._robot.find_bodies("body")[0]
         
-        # Debug visualization
         self.set_debug_vis(self.cfg.debug_vis)
         
-        # Print info
         self._print_env_info()
     
     def _print_env_info(self):
-        """Print environment configuration."""
         print("\n" + "="*60)
-        print("Crazyflie L2F Navigation Environment (Two-Phase)")
+        print("Crazyflie L2F Navigation V2 (Single-Phase)")
         print("="*60)
         print(f"  Physics dt:        {self._dt*1000:.1f} ms ({1/self._dt:.0f} Hz)")
         print(f"  Episode length:    {self.cfg.episode_length_s:.1f} s")
         print(f"  Num envs:          {self.num_envs}")
         print(f"  Observation dim:   {self.cfg.observation_space}")
         print(f"  Action dim:        {self.cfg.action_space}")
-        print(f"  Mass:              {self._mass*1000:.1f} g")
-        print(f"  Hover RPM:         {self._hover_rpm:.0f}")
+        print(f"  Goal XY range:     ±{self.cfg.goal_xy_range:.1f} m")
+        print(f"  Goal Z range:      {self.cfg.goal_z_min:.1f} - {self.cfg.goal_z_max:.1f} m")
+        print(f"  Reaching threshold:{self.cfg.reaching_threshold:.2f} m")
         print(f"  Hover action:      {self._hover_action:.4f}")
-        print("-"*60)
-        print("  PHASE 1 (Hover):")
-        print(f"    Duration:        {self.cfg.hover_time:.1f} s ({self._hover_steps} steps)")
-        print(f"    Target height:   {self.cfg.init_target_height:.2f} m")
-        print("  PHASE 2 (Navigate):")
-        print(f"    Max distance:    {self.cfg.nav_distance_max:.2f} m")
-        print(f"    Reach threshold: {self.cfg.nav_reaching_threshold:.2f} m")
         print("="*60 + "\n")
     
     def _setup_scene(self):
-        """Set up the simulation scene."""
         self._robot = Articulation(self.cfg.robot)
         self.scene.articulations["robot"] = self._robot
         
@@ -367,7 +329,6 @@ class CrazyflieNavEnv(DirectRLEnv):
         
         self.scene.clone_environments(copy_from_source=False)
         
-        # Add lighting
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
     
@@ -389,27 +350,21 @@ class CrazyflieNavEnv(DirectRLEnv):
     
     def _pre_physics_step(self, actions: torch.Tensor):
         """Process actions using L2F motor model."""
-        # Store previous action for action rate penalty
         self._prev_actions = self._actions.clone()
         self._actions = actions.clone().clamp(-1.0, 1.0)
         
-        # Map to target RPM
         target_rpm = (self._actions + 1.0) / 2.0 * self._max_rpm
         
-        # Apply first-order motor dynamics
         self._rpm_state = self._rpm_state + self._motor_alpha * (target_rpm - self._rpm_state)
         self._rpm_state = self._rpm_state.clamp(self._min_rpm, self._max_rpm)
         
-        # Compute thrust per motor
         thrust_per_motor = self._thrust_coef * self._rpm_state ** 2
         
-        # Total thrust (body z-axis)
         total_thrust = thrust_per_motor.sum(dim=-1)
         
         thrust_body = torch.zeros(self.num_envs, 3, device=self.device)
         thrust_body[:, 2] = total_thrust
         
-        # Roll torque
         roll_torque = (
             thrust_per_motor[:, 0] * self._rotor_positions[0, 1] +
             thrust_per_motor[:, 1] * self._rotor_positions[1, 1] +
@@ -417,7 +372,6 @@ class CrazyflieNavEnv(DirectRLEnv):
             thrust_per_motor[:, 3] * self._rotor_positions[3, 1]
         )
         
-        # Pitch torque
         pitch_torque = -(
             thrust_per_motor[:, 0] * self._rotor_positions[0, 0] +
             thrust_per_motor[:, 1] * self._rotor_positions[1, 0] +
@@ -425,7 +379,6 @@ class CrazyflieNavEnv(DirectRLEnv):
             thrust_per_motor[:, 3] * self._rotor_positions[3, 0]
         )
         
-        # Yaw torque
         yaw_torque = self._torque_coef * (
             self._rotor_yaw_dirs[0] * thrust_per_motor[:, 0] +
             self._rotor_yaw_dirs[1] * thrust_per_motor[:, 1] +
@@ -435,7 +388,6 @@ class CrazyflieNavEnv(DirectRLEnv):
         
         torque_body = torch.stack([roll_torque, pitch_torque, yaw_torque], dim=-1)
         
-        # Add disturbances
         if self.cfg.enable_disturbance:
             thrust_body = thrust_body + self._disturbance_force
             torque_body = torque_body + self._disturbance_torque
@@ -448,7 +400,6 @@ class CrazyflieNavEnv(DirectRLEnv):
         self._action_history[:, -1] = self._actions
     
     def _apply_action(self):
-        """Apply forces and torques to the robot."""
         self._robot.set_external_force_and_torque(
             forces=self._thrust_body,
             torques=self._torque_body,
@@ -456,48 +407,26 @@ class CrazyflieNavEnv(DirectRLEnv):
         )
         self._robot.write_data_to_sim()
     
-    def _get_current_target(self) -> torch.Tensor:
-        """Get current target position based on phase."""
-        # Hover target: env origin + target height
-        hover_target = self._terrain.env_origins.clone()
-        hover_target[:, 2] += self.cfg.init_target_height
-        
-        # Navigation phase: use nav target (set after hover stabilizes)
-        # Return hover_target for phase 0, nav_target for phase 1
-        target = torch.where(
-            self._phase.unsqueeze(-1) == 0,
-            hover_target,
-            self._nav_target
-        )
-        return target
-    
     def _get_observations(self) -> dict:
         """Construct observations matching L2F firmware format (146 dims).
         
-        The observation is relative to the CURRENT target (hover or nav).
+        Observation = [pos_error(3), rot_matrix(9), lin_vel(3), ang_vel(3), action_history(128)]
         """
         pos_w = self._robot.data.root_pos_w
         quat_w = self._robot.data.root_quat_w
         lin_vel_w = self._robot.data.root_lin_vel_w
         ang_vel_b = self._robot.data.root_ang_vel_b
         
-        # Position relative to current target
-        target_pos = self._get_current_target()
-        pos_error = pos_w - target_pos
-        
-        # Clip position error
+        # Position error relative to goal
+        pos_error = pos_w - self._goal_pos_w
         pos_error_clipped = pos_error.clamp(-0.5, 0.5)
         
-        # Clip velocity
         lin_vel_clipped = lin_vel_w.clamp(-2.0, 2.0)
         
-        # Rotation matrix
         rot_matrix = self._quat_to_rotation_matrix(quat_w)
         
-        # Action history (flatten)
         action_history_flat = self._action_history.view(self.num_envs, -1)
         
-        # Concatenate (146 dims total)
         obs = torch.cat([
             pos_error_clipped,   # 3
             rot_matrix,          # 9
@@ -508,166 +437,50 @@ class CrazyflieNavEnv(DirectRLEnv):
         
         return {"policy": obs}
     
-    def _check_hover_stable(self) -> torch.Tensor:
-        """Check if drone is stable enough to transition to navigation phase."""
-        cfg = self.cfg
-        
-        pos_w = self._robot.data.root_pos_w
-        lin_vel = self._robot.data.root_lin_vel_w
-        
-        # Hover target
-        hover_target = self._terrain.env_origins.clone()
-        hover_target[:, 2] += cfg.init_target_height
-        
-        pos_error = pos_w - hover_target
-        
-        # Check XY position
-        xy_ok = torch.norm(pos_error[:, :2], dim=-1) < cfg.hover_xy_threshold
-        
-        # Check height
-        z_ok = torch.abs(pos_error[:, 2]) < cfg.hover_z_threshold
-        
-        # Check velocity
-        vel_ok = torch.norm(lin_vel, dim=-1) < cfg.hover_velocity_threshold
-        
-        return xy_ok & z_ok & vel_ok
-    
-    def _transition_to_navigation(self, env_ids: torch.Tensor):
-        """Transition specified environments from hover to navigation phase."""
-        if len(env_ids) == 0:
-            return
-        
-        cfg = self.cfg
-        n = len(env_ids)
-        
-        # Set phase to navigation
-        self._phase[env_ids] = 1
-        
-        # Generate random navigation target (XY offset from current position)
-        # Keep same height during navigation
-        current_pos = self._robot.data.root_pos_w[env_ids].clone()
-        
-        # Random XY offset
-        angle = torch.rand(n, device=self.device) * 2 * math.pi
-        distance = torch.rand(n, device=self.device) * cfg.nav_distance_max
-        
-        xy_offset = torch.zeros(n, 2, device=self.device)
-        xy_offset[:, 0] = distance * torch.cos(angle)
-        xy_offset[:, 1] = distance * torch.sin(angle)
-        
-        # Set navigation target
-        self._nav_target[env_ids, 0] = current_pos[:, 0] + xy_offset[:, 0]
-        self._nav_target[env_ids, 1] = current_pos[:, 1] + xy_offset[:, 1]
-        self._nav_target[env_ids, 2] = self._terrain.env_origins[env_ids, 2] + cfg.init_target_height
-    
     def _get_rewards(self) -> torch.Tensor:
-        """Compute reward based on current phase."""
+        """Compute reward using tanh-based distance metric (proven approach)."""
         cfg = self.cfg
         
         pos_w = self._robot.data.root_pos_w
-        quat = self._robot.data.root_quat_w
         lin_vel = self._robot.data.root_lin_vel_w
         ang_vel = self._robot.data.root_ang_vel_b
         
-        # Get current target
-        target_pos = self._get_current_target()
-        pos_error = pos_w - target_pos
+        # Distance to goal
+        distance_to_goal = torch.linalg.norm(self._goal_pos_w - pos_w, dim=1)
         
-        # === PHASE 1: HOVER REWARD ===
-        # XY position cost
-        xy_cost = (pos_error[:, :2] ** 2).sum(dim=-1)
+        # Tanh-based distance reward (1 at goal, 0 far away)
+        distance_mapped = 1.0 - torch.tanh(distance_to_goal / cfg.distance_tanh_scale)
+        distance_reward = distance_mapped * cfg.distance_reward_scale * self._dt
         
-        # Height cost
-        height_cost = pos_error[:, 2] ** 2
+        # Reaching bonus (one-time when first reaching goal)
+        just_reached = (distance_to_goal < cfg.reaching_threshold) & ~self._goal_reached
+        reaching_bonus = just_reached.float() * cfg.reaching_bonus
+        self._goal_reached = self._goal_reached | just_reached
         
-        # Orientation cost
-        orientation_cost = 1.0 - quat[:, 0] ** 2
+        # Stability penalties
+        lin_vel_sq = (lin_vel ** 2).sum(dim=-1)
+        ang_vel_sq = (ang_vel ** 2).sum(dim=-1)
+        yaw_rate_sq = ang_vel[:, 2] ** 2  # Z-axis angular velocity (yaw rate)
         
-        # Velocity cost
-        velocity_cost = (lin_vel ** 2).sum(dim=-1)
+        lin_vel_penalty = lin_vel_sq * cfg.lin_vel_penalty * self._dt
+        ang_vel_penalty = ang_vel_sq * cfg.ang_vel_penalty * self._dt
+        yaw_rate_penalty = yaw_rate_sq * cfg.yaw_rate_penalty * self._dt
         
-        # Angular velocity cost
-        angular_velocity_cost = (ang_vel ** 2).sum(dim=-1)
-        
-        # Action cost
-        action_deviation = self._actions - self._hover_action
-        action_cost = (action_deviation ** 2).sum(dim=-1)
-        
-        # Action rate cost (penalize rapid changes for smooth control)
+        # Action rate penalty (smooth control)
         action_rate = self._actions - self._prev_actions
-        action_rate_cost = (action_rate ** 2).sum(dim=-1)
+        action_rate_sq = (action_rate ** 2).sum(dim=-1)
+        action_rate_penalty = action_rate_sq * cfg.action_rate_penalty * self._dt
         
-        # Hover weighted cost
-        hover_cost = (
-            cfg.hover_position_weight * xy_cost +
-            cfg.hover_height_weight * height_cost +
-            cfg.hover_orientation_weight * orientation_cost +
-            cfg.hover_velocity_weight * velocity_cost +
-            cfg.hover_angular_velocity_weight * angular_velocity_cost +
-            cfg.hover_action_weight * action_cost +
-            cfg.hover_action_rate_weight * action_rate_cost  # NEW
-        )
-        
-        hover_reward = -cfg.reward_scale * hover_cost + cfg.reward_constant
-        hover_reward = hover_reward.clamp(0.0, cfg.reward_constant)
-        
-        # === PHASE 2: NAVIGATION REWARD ===
-        # Distance to target
-        distance_to_target = torch.norm(pos_error, dim=-1)
-        
-        # Progress reward (closer = better)
-        nav_position_reward = torch.exp(-distance_to_target / 0.2)  # Exponential falloff
-        
-        # Reaching bonus
-        reached = distance_to_target < cfg.nav_reaching_threshold
-        reaching_bonus = reached.float() * cfg.nav_reaching_bonus
-        
-        # Navigation weighted cost (penalize instability during navigation)
-        nav_cost = (
-            cfg.nav_orientation_weight * orientation_cost +
-            cfg.nav_velocity_weight * velocity_cost +           # Added velocity penalty
-            cfg.nav_angular_velocity_weight * angular_velocity_cost +
-            cfg.nav_action_weight * action_cost +
-            cfg.nav_action_rate_weight * action_rate_cost       # NEW - smooth actions
-        )
-        
-        nav_reward = cfg.nav_position_weight * nav_position_reward - nav_cost + reaching_bonus
-        nav_reward = nav_reward.clamp(0.0, cfg.nav_position_weight + cfg.nav_reaching_bonus)
-        
-        # === COMBINE BASED ON PHASE ===
-        is_hover_phase = self._phase == 0
-        reward = torch.where(is_hover_phase, hover_reward, nav_reward)
-        
-        # === PHASE TRANSITION CHECK ===
-        # Check if drone is stable enough to transition
-        is_stable = self._check_hover_stable()
-        
-        # Increment stable counter for hover phase drones (decay instead of reset)
-        self._hover_stable_count = torch.where(
-            is_hover_phase & is_stable,
-            self._hover_stable_count + 1,
-            (self._hover_stable_count * 0.9).clamp(min=0)  # Decay instead of reset
-        )
-        
-        # Transition after hover_steps (3 seconds at 100Hz = 300 steps)
-        # Option 1: Stable for enough steps, OR
-        # Option 2: Been hovering long enough even if slightly wobbly (time-based fallback)
-        stable_enough = self._hover_stable_count >= cfg.hover_stable_steps_required
-        time_fallback = self.episode_length_buf >= (self._hover_steps * 1.5)  # 4.5 seconds fallback
-        
-        should_transition = (
-            is_hover_phase & 
-            (self.episode_length_buf >= self._hover_steps) &
-            (stable_enough | time_fallback)
-        )
-        
-        transition_ids = torch.where(should_transition)[0]
-        if len(transition_ids) > 0:
-            self._transition_to_navigation(transition_ids)
+        # Total reward
+        reward = distance_reward + reaching_bonus - lin_vel_penalty - ang_vel_penalty - yaw_rate_penalty - action_rate_penalty
         
         # Track stats
-        self._episode_sums["hover_reward"] += torch.where(is_hover_phase, hover_reward, torch.zeros_like(hover_reward))
-        self._episode_sums["nav_reward"] += torch.where(~is_hover_phase, nav_reward, torch.zeros_like(nav_reward))
+        self._episode_sums["distance_reward"] += distance_reward
+        self._episode_sums["reaching_bonus"] += reaching_bonus
+        self._episode_sums["lin_vel_penalty"] += lin_vel_penalty
+        self._episode_sums["ang_vel_penalty"] += ang_vel_penalty
+        self._episode_sums["yaw_rate_penalty"] += yaw_rate_penalty
+        self._episode_sums["action_rate_penalty"] += action_rate_penalty
         self._episode_sums["total_reward"] += reward
         
         return reward
@@ -683,7 +496,7 @@ class CrazyflieNavEnv(DirectRLEnv):
         lin_vel = self._robot.data.root_lin_vel_w
         ang_vel = self._robot.data.root_ang_vel_b
         
-        # XY position relative to env origin (not target)
+        # XY position relative to env origin
         xy_offset = pos_w[:, :2] - self._terrain.env_origins[:, :2]
         xy_exceeded = torch.norm(xy_offset, dim=-1) > cfg.term_xy_threshold
         
@@ -698,15 +511,15 @@ class CrazyflieNavEnv(DirectRLEnv):
         too_tilted = tilt_angle > cfg.term_tilt_threshold
         
         # Velocity checks
-        lin_vel_exceeded = torch.norm(lin_vel, dim=-1) > cfg.term_linear_velocity_threshold
-        ang_vel_exceeded = torch.norm(ang_vel, dim=-1) > cfg.term_angular_velocity_threshold
+        lin_vel_exceeded = torch.norm(lin_vel, dim=-1) > cfg.term_lin_vel_threshold
+        ang_vel_exceeded = torch.norm(ang_vel, dim=-1) > cfg.term_ang_vel_threshold
         
         terminated = xy_exceeded | too_low | too_high | too_tilted | lin_vel_exceeded | ang_vel_exceeded
         
         return terminated, time_out
     
     def _reset_idx(self, env_ids: torch.Tensor | None):
-        """Reset specified environments."""
+        """Reset specified environments with new random goals."""
         if env_ids is None or len(env_ids) == 0:
             return
         
@@ -717,38 +530,43 @@ class CrazyflieNavEnv(DirectRLEnv):
                 avg = torch.mean(values[env_ids]).item()
                 steps = self.episode_length_buf[env_ids].float().mean().item()
                 if steps > 0:
-                    extras[f"Episode/{key}"] = avg / steps
+                    extras[f"Episode/{key}"] = avg / max(steps, 1)
             self.extras["log"] = extras
         
-        # Reset robot
         self._robot.reset(env_ids)
         super()._reset_idx(env_ids)
         
         n = len(env_ids)
         cfg = self.cfg
         
-        # Reset phase to hover (phase 0)
-        self._phase[env_ids] = 0
-        self._hover_stable_count[env_ids] = 0
+        # Reset goal reached flag
+        self._goal_reached[env_ids] = False
         
-        # Initialize position at hover target
-        pos = torch.zeros(n, 3, device=self.device)
-        pos[:, 2] = cfg.init_target_height
-        pos = pos + self._terrain.env_origins[env_ids]
+        # Sample random spawn position (near center)
+        spawn_pos = torch.zeros(n, 3, device=self.device)
+        spawn_pos[:, 0] = (torch.rand(n, device=self.device) * 2 - 1) * cfg.spawn_xy_range
+        spawn_pos[:, 1] = (torch.rand(n, device=self.device) * 2 - 1) * cfg.spawn_xy_range
+        spawn_pos[:, 2] = cfg.spawn_z
+        spawn_pos = spawn_pos + self._terrain.env_origins[env_ids]
         
-        # Initialize nav target to hover target (will be updated at phase transition)
-        self._nav_target[env_ids] = pos.clone()
+        # Sample random goal position
+        self._goal_pos_w[env_ids, 0] = self._terrain.env_origins[env_ids, 0] + \
+            (torch.rand(n, device=self.device) * 2 - 1) * cfg.goal_xy_range
+        self._goal_pos_w[env_ids, 1] = self._terrain.env_origins[env_ids, 1] + \
+            (torch.rand(n, device=self.device) * 2 - 1) * cfg.goal_xy_range
+        self._goal_pos_w[env_ids, 2] = self._terrain.env_origins[env_ids, 2] + \
+            cfg.goal_z_min + torch.rand(n, device=self.device) * (cfg.goal_z_max - cfg.goal_z_min)
         
-        # Identity quaternion
+        # Identity quaternion with small perturbation
         quat = torch.zeros(n, 4, device=self.device)
         quat[:, 0] = 1.0
         
-        # Zero velocities
-        lin_vel = torch.zeros(n, 3, device=self.device)
-        ang_vel = torch.zeros(n, 3, device=self.device)
+        # Small initial velocities
+        lin_vel = (torch.rand(n, 3, device=self.device) * 2 - 1) * cfg.spawn_vel_range
+        ang_vel = (torch.rand(n, 3, device=self.device) * 2 - 1) * cfg.spawn_ang_range
         
         # Write to sim
-        root_pose = torch.cat([pos, quat], dim=-1)
+        root_pose = torch.cat([spawn_pos, quat], dim=-1)
         root_vel = torch.cat([lin_vel, ang_vel], dim=-1)
         
         self._robot.write_root_pose_to_sim(root_pose, env_ids)
@@ -760,7 +578,7 @@ class CrazyflieNavEnv(DirectRLEnv):
         # Initialize action history to hover action
         self._action_history[env_ids] = self._hover_action
         self._actions[env_ids] = self._hover_action
-        self._prev_actions[env_ids] = self._hover_action  # Initialize prev actions
+        self._prev_actions[env_ids] = self._hover_action
         
         # Sample disturbances
         if cfg.enable_disturbance:
@@ -772,10 +590,9 @@ class CrazyflieNavEnv(DirectRLEnv):
             self._episode_sums[key][env_ids] = 0.0
     
     def _set_debug_vis_impl(self, debug_vis: bool):
-        """Set up debug visualization."""
         if debug_vis:
             marker_cfg = CUBOID_MARKER_CFG.copy()
-            marker_cfg.markers["cuboid"].size = (0.05, 0.05, 0.05)
+            marker_cfg.markers["cuboid"].size = (0.1, 0.1, 0.1)
             marker_cfg.prim_path = "/Visuals/Command/goal_position"
             self._goal_markers = VisualizationMarkers(marker_cfg)
         else:
@@ -783,20 +600,18 @@ class CrazyflieNavEnv(DirectRLEnv):
                 self._goal_markers.set_visibility(False)
     
     def _debug_vis_callback(self, event):
-        """Update debug visualization."""
         if hasattr(self, "_goal_markers"):
-            goal_pos = self._get_current_target()
-            self._goal_markers.visualize(goal_pos)
+            self._goal_markers.visualize(self._goal_pos_w)
 
 
 # ==============================================================================
-# L2F-Compatible Actor Network (same as hover)
+# L2F-Compatible Networks
 # ==============================================================================
 
 class L2FActorNetwork(nn.Module):
     """Actor network matching L2F architecture exactly."""
     
-    HOVER_ACTION = 2.0 * math.sqrt(0.027 * 9.81 / (4 * 3.16e-10)) / 21702.0 - 1.0
+    HOVER_ACTION = L2FConstants.hover_action()
     
     def __init__(self, obs_dim: int = 146, hidden_dim: int = 64, action_dim: int = 4, init_std: float = 0.3):
         super().__init__()
@@ -866,7 +681,7 @@ class L2FCriticNetwork(nn.Module):
 
 
 # ==============================================================================
-# PPO Agent with Observation Normalization
+# PPO Agent
 # ==============================================================================
 
 class RunningMeanStd:
@@ -1053,9 +868,9 @@ def compute_gae(rewards, values, dones, next_value, gamma=0.99, gae_lambda=0.95)
     return returns, advantages
 
 
-def train(env: CrazyflieNavEnv, agent: L2FPPOAgent, args):
+def train(env: CrazyflieNavV2Env, agent: L2FPPOAgent, args):
     """Main training loop."""
-    checkpoint_dir = os.path.join(os.path.dirname(__file__), "checkpoints_nav")
+    checkpoint_dir = os.path.join(os.path.dirname(__file__), "checkpoints_nav_v2")
     os.makedirs(checkpoint_dir, exist_ok=True)
     
     steps_per_rollout = 128
@@ -1064,38 +879,33 @@ def train(env: CrazyflieNavEnv, agent: L2FPPOAgent, args):
     best_reward = float("-inf")
     start_iteration = 0
     
-    # Load checkpoint if resuming (curriculum learning from hover)
+    # Load checkpoint if resuming
     if args.resume_from is not None:
         if os.path.exists(args.resume_from):
             print(f"\n{'='*60}")
-            print("CURRICULUM LEARNING: Loading pre-trained checkpoint")
+            print("Loading pre-trained checkpoint (e.g., from hover training)")
             print(f"{'='*60}")
             print(f"  Checkpoint: {args.resume_from}")
-            start_iteration, best_reward = agent.load(args.resume_from)
+            start_iteration, _ = agent.load(args.resume_from)
             print(f"  Loaded from iteration: {start_iteration}")
-            print(f"  Previous best reward:  {best_reward:.3f}")
-            print(f"  (Resetting iteration counter for nav training)")
-            start_iteration = 0  # Start fresh iteration count for nav
-            best_reward = float("-inf")  # Reset best reward for nav phase
+            print(f"  (Resetting counters for navigation training)")
+            start_iteration = 0
+            best_reward = float("-inf")
             print(f"{'='*60}\n")
         else:
             print(f"WARNING: Checkpoint not found: {args.resume_from}")
-            print("Starting training from scratch...")
     
     print(f"\n{'='*60}")
-    print("Starting L2F Navigation PPO Training (Two-Phase)")
+    print("Starting L2F Navigation V2 PPO Training (Single-Phase)")
     print(f"{'='*60}")
     print(f"  Environments:       {num_envs}")
     print(f"  Max iterations:     {args.max_iterations}")
     print(f"  Steps per rollout:  {steps_per_rollout}")
     print(f"  Total batch size:   {steps_per_rollout * num_envs}")
-    print(f"  Hover time:         {args.hover_time}s")
-    print(f"  Nav distance:       {args.nav_distance}m")
-    if args.resume_from:
-        print(f"  Resumed from:       {os.path.basename(args.resume_from)}")
+    print(f"  Goal XY range:      ±{args.goal_xy_range}m")
+    print(f"  Goal Z range:       {args.goal_z_min}-{args.goal_z_max}m")
     print(f"{'='*60}\n")
     
-    # Initial reset ONCE - episodes persist across iterations
     obs_dict, _ = env.reset()
     obs = obs_dict["policy"]
     
@@ -1107,10 +917,8 @@ def train(env: CrazyflieNavEnv, agent: L2FPPOAgent, args):
         reward_buffer = []
         done_buffer = []
         
-        # Don't reset here! Let episodes continue across rollouts.
-        # env.step() handles individual env resets when they terminate.
-        
         episode_rewards = torch.zeros(num_envs, device=env.device)
+        goals_reached = 0
         
         for step in range(steps_per_rollout):
             action, log_prob, value = agent.get_action_and_value(obs)
@@ -1127,6 +935,9 @@ def train(env: CrazyflieNavEnv, agent: L2FPPOAgent, args):
             reward_buffer.append(reward)
             done_buffer.append(done)
             episode_rewards += reward
+            
+            # Count goals reached
+            goals_reached += env._goal_reached.sum().item()
             
             obs = next_obs
         
@@ -1155,10 +966,7 @@ def train(env: CrazyflieNavEnv, agent: L2FPPOAgent, args):
         
         mean_reward = episode_rewards.mean().item() / steps_per_rollout
         mean_return = returns_flat.mean().item()
-        
-        # Count phase transitions
-        nav_count = (env._phase == 1).sum().item()
-        nav_pct = nav_count / num_envs * 100
+        reach_rate = goals_reached / (steps_per_rollout * num_envs) * 100
         
         is_best = mean_reward > best_reward
         if is_best:
@@ -1167,7 +975,7 @@ def train(env: CrazyflieNavEnv, agent: L2FPPOAgent, args):
         
         if iteration % 10 == 0 or is_best:
             star = " *BEST*" if is_best else ""
-            print(f"[Iter {iteration:4d}] Reward: {mean_reward:8.3f} | Return: {mean_return:8.2f} | Nav: {nav_pct:5.1f}% | Loss: {loss:.4f}{star}")
+            print(f"[Iter {iteration:4d}] Reward: {mean_reward:8.3f} | Return: {mean_return:8.2f} | Reach: {reach_rate:5.1f}% | Loss: {loss:.4f}{star}")
         
         if iteration > 0 and iteration % args.save_interval == 0:
             agent.save(os.path.join(checkpoint_dir, f"checkpoint_{iteration}.pt"), iteration, best_reward)
@@ -1177,12 +985,11 @@ def train(env: CrazyflieNavEnv, agent: L2FPPOAgent, args):
     print(f"Checkpoints saved to: {checkpoint_dir}")
 
 
-def play(env: CrazyflieNavEnv, agent: L2FPPOAgent, checkpoint_path: str):
+def play(env: CrazyflieNavV2Env, agent: L2FPPOAgent, checkpoint_path: str):
     """Run trained policy with visualization."""
     iteration, best_reward = agent.load(checkpoint_path)
     print(f"\n[Play Mode] Loaded checkpoint from iteration {iteration}")
     print(f"[Play Mode] Best training reward: {best_reward:.3f}")
-    print("[Play Mode] Policy uses trained smooth control (action rate penalty)")
     print("[Play Mode] Press Ctrl+C to stop\n")
     
     obs_dict, _ = env.reset()
@@ -1190,22 +997,24 @@ def play(env: CrazyflieNavEnv, agent: L2FPPOAgent, checkpoint_path: str):
     
     step_count = 0
     episode_reward = 0.0
+    goals_reached = 0
     
     try:
         while simulation_app.is_running():
-            # Get action directly from policy - it should be smooth from training
             action = agent.get_action(obs, deterministic=True)
             
             obs_dict, reward, _, _, _ = env.step(action)
             obs = obs_dict["policy"]
             
             episode_reward += reward.mean().item()
+            goals_reached += env._goal_reached.sum().item()
             step_count += 1
             
             if step_count % 100 == 0:
-                nav_count = (env._phase == 1).sum().item()
-                phase_str = f"Nav: {nav_count}/{env.num_envs}"
-                print(f"[Step {step_count:5d}] Reward: {episode_reward:.2f} | {phase_str}")
+                avg_dist = torch.linalg.norm(
+                    env._goal_pos_w - env._robot.data.root_pos_w, dim=1
+                ).mean().item()
+                print(f"[Step {step_count:5d}] Reward: {episode_reward:.2f} | Avg Dist: {avg_dist:.3f}m | Goals: {goals_reached}")
     
     except KeyboardInterrupt:
         print("\n[Play Mode] Stopped by user")
@@ -1216,12 +1025,13 @@ def play(env: CrazyflieNavEnv, agent: L2FPPOAgent, checkpoint_path: str):
 # ==============================================================================
 
 def main():
-    cfg = CrazyflieNavEnvCfg()
+    cfg = CrazyflieNavV2EnvCfg()
     cfg.scene.num_envs = args.num_envs
-    cfg.hover_time = args.hover_time
-    cfg.nav_distance_max = args.nav_distance
+    cfg.goal_xy_range = args.goal_xy_range
+    cfg.goal_z_min = args.goal_z_min
+    cfg.goal_z_max = args.goal_z_max
     
-    env = CrazyflieNavEnv(cfg)
+    env = CrazyflieNavV2Env(cfg)
     
     agent = L2FPPOAgent(
         obs_dim=cfg.observation_space,
@@ -1233,7 +1043,7 @@ def main():
     
     if args.play:
         if args.checkpoint is None:
-            checkpoint_dir = os.path.join(os.path.dirname(__file__), "checkpoints_nav")
+            checkpoint_dir = os.path.join(os.path.dirname(__file__), "checkpoints_nav_v2")
             args.checkpoint = os.path.join(checkpoint_dir, "best_model.pt")
         
         if not os.path.exists(args.checkpoint):
