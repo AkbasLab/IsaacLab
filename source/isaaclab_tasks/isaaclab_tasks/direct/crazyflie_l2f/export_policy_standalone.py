@@ -22,7 +22,7 @@ import math
 # L2F-Compatible Actor Network Definition (same as in train_hover.py)
 # ============================================================================
 class L2FActorNetwork(nn.Module):
-    """Actor network matching L2F's architecture exactly: 146 → 64 → 64 → 4"""
+    """Actor network matching L2F's architecture exactly: obs_dim → 64 → 64 → 4"""
     
     # L2F constants
     MASS = 0.027  # kg
@@ -36,6 +36,7 @@ class L2FActorNetwork(nn.Module):
     def __init__(self, obs_dim: int = 146, action_dim: int = 4, hidden_dim: int = 64):
         super().__init__()
         
+        self.obs_dim = obs_dim
         self.fc1 = nn.Linear(obs_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, action_dim)
@@ -118,9 +119,9 @@ def generate_layer_code(
     return code
 
 
-def create_test_observation() -> np.ndarray:
+def create_test_observation(obs_dim: int = 146) -> np.ndarray:
     """Create a test observation representing hover state"""
-    obs = np.zeros(146, dtype=np.float32)
+    obs = np.zeros(obs_dim, dtype=np.float32)
     
     # Position error (already 0 for hover)
     # obs[0:3] = 0
@@ -146,7 +147,10 @@ def create_test_observation() -> np.ndarray:
     # Action history: 32 timesteps × 4 motors = 128 values
     # Fill with hover action (~0.334)
     hover_action = L2FActorNetwork.HOVER_ACTION
-    obs[18:146] = hover_action
+    obs[18:min(146, obs_dim)] = hover_action
+    
+    # For pointnav (149 obs), last 3 are goal relative position - set to 0 (at goal)
+    # obs[146:149] = 0  # already zero
     
     return obs
 
@@ -198,8 +202,14 @@ def export_to_firmware(
     else:
         raise ValueError("Unsupported checkpoint format")
     
-    # Create actor network and load weights
-    actor = L2FActorNetwork()
+    # Detect observation dimension from fc1.weight shape
+    obs_dim = 146  # default
+    if 'fc1.weight' in actor_state:
+        obs_dim = actor_state['fc1.weight'].shape[1]
+        print(f"\n  Detected observation dimension: {obs_dim}")
+    
+    # Create actor network with correct obs dim and load weights
+    actor = L2FActorNetwork(obs_dim=obs_dim)
     
     # Load state dict - need to skip log_std if it's in actor_state but not in our network
     # Filter out any keys not in the network
@@ -215,22 +225,34 @@ def export_to_firmware(
     print(f"    fc3.bias: {actor.fc3.bias.data.numpy()}")
     
     # Extract weights
-    w1 = actor.fc1.weight.detach().numpy()  # (64, 146)
+    w1 = actor.fc1.weight.detach().numpy()  # (64, obs_dim)
     b1 = actor.fc1.bias.detach().numpy()    # (64,)
     w2 = actor.fc2.weight.detach().numpy()  # (64, 64)
     b2 = actor.fc2.bias.detach().numpy()    # (64,)
     w3 = actor.fc3.weight.detach().numpy()  # (4, 64)
     b3 = actor.fc3.bias.detach().numpy()    # (4,)
     
+    # Truncate to 146 inputs for firmware compatibility
+    # If obs_dim > 146, drop the extra columns (goal_rel weights)
+    # This is equivalent to setting goal_rel = [0,0,0] at inference
+    firmware_obs_dim = 146
+    if w1.shape[1] > firmware_obs_dim:
+        print(f"\n  Truncating fc1 weights from {w1.shape[1]} to {firmware_obs_dim} inputs")
+        print(f"  (Dropping goal_rel weights - firmware will infer with goal_rel=[0,0,0])")
+        w1 = w1[:, :firmware_obs_dim]
+    
     print(f"\n  Layer 0: {w1.shape[1]} → {w1.shape[0]}")
     print(f"  Layer 1: {w2.shape[1]} → {w2.shape[0]}")
     print(f"  Layer 2: {w3.shape[1]} → {w3.shape[0]}")
     
-    # Create test observation and compute expected action
-    test_obs = create_test_observation()
-    with torch.no_grad():
-        test_obs_tensor = torch.from_numpy(test_obs).unsqueeze(0)
-        expected_action = actor(test_obs_tensor).squeeze(0).numpy()
+    # Create test observation and compute expected action (use 146 for firmware)
+    test_obs = create_test_observation(firmware_obs_dim)
+    
+    # Manually compute forward pass with truncated weights
+    # (Can't use original actor since it expects 149 inputs)
+    h1 = np.tanh(w1 @ test_obs + b1)
+    h2 = np.tanh(w2 @ h1 + b2)
+    expected_action = np.tanh(w3 @ h2 + b3)
     
     print(f"\n  Test observation shape: {test_obs.shape}")
     print(f"  Expected action: {expected_action}")
@@ -241,14 +263,15 @@ def export_to_firmware(
     print(f"  Mean action output: {mean_action:.4f}")
     
     # Generate C++ header
-    header = '''// rl_tools checkpoint generated from Isaac Lab training
-// Architecture: 146 → 64 → 64 → 4 with FAST_TANH activation
+    header = f'''// rl_tools checkpoint generated from Isaac Lab training
+// Architecture: {firmware_obs_dim} → 64 → 64 → 4 with FAST_TANH activation
+// Original obs_dim: {obs_dim} (truncated for firmware compatibility)
 
-namespace rl_tools::checkpoint::actor {
+namespace rl_tools::checkpoint::actor {{
 '''
     
-    # Add layers
-    header += generate_layer_code(0, w1, b1, 146, 64, is_output=False) + "\n"
+    # Add layers (use firmware_obs_dim for layer 0)
+    header += generate_layer_code(0, w1, b1, firmware_obs_dim, 64, is_output=False) + "\n"
     header += generate_layer_code(1, w2, b2, 64, 64, is_output=False) + "\n"
     header += generate_layer_code(2, w3, b3, 64, 4, is_output=True) + "\n"
     
@@ -264,14 +287,14 @@ namespace rl_tools::checkpoint::actor {
     
     # Add test observation
     obs_bytes = float_array_to_bytes(test_obs)
-    header += '''#include <rl_tools/containers.h>
-namespace rl_tools::checkpoint::observation {
+    header += f'''#include <rl_tools/containers.h>
+namespace rl_tools::checkpoint::observation {{
     static_assert(sizeof(unsigned char) == 1);
-    alignas(float) const unsigned char memory[] = {''' + bytes_to_c_array(obs_bytes) + '''};
-    using CONTAINER_SPEC = RL_TOOLS_NAMESPACE_WRAPPER ::rl_tools::matrix::Specification<float, unsigned long, 1, 146, RL_TOOLS_NAMESPACE_WRAPPER ::rl_tools::matrix::layouts::RowMajorAlignment<unsigned long, 1>>;
+    alignas(float) const unsigned char memory[] = {{''' + bytes_to_c_array(obs_bytes) + f'''}};
+    using CONTAINER_SPEC = RL_TOOLS_NAMESPACE_WRAPPER ::rl_tools::matrix::Specification<float, unsigned long, 1, {firmware_obs_dim}, RL_TOOLS_NAMESPACE_WRAPPER ::rl_tools::matrix::layouts::RowMajorAlignment<unsigned long, 1>>;
     using CONTAINER_TYPE = RL_TOOLS_NAMESPACE_WRAPPER ::rl_tools::MatrixDynamic<CONTAINER_SPEC>;
-    const CONTAINER_TYPE container = {(float*)memory};
-}
+    const CONTAINER_TYPE container = {{(float*)memory}};
+}}
 
 '''
     
