@@ -32,6 +32,9 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 import gymnasium as gym
+import numpy as np
+import matplotlib.pyplot as plt
+import time
 
 # Isaac Sim setup - must happen before other imports
 from isaaclab.app import AppLauncher
@@ -79,6 +82,9 @@ from isaaclab.markers.config import CUBOID_MARKER_CFG
 
 # Import our custom Crazyflie configuration
 from crazyflie_21_cfg import CRAZYFLIE_21_CFG, CrazyflieL2FParams
+
+# Import flight evaluation utilities
+from flight_eval_utils import FlightDataLogger, quat_to_euler
 
 
 # ==============================================================================
@@ -1126,11 +1132,11 @@ def train(env: CrazyflieL2FEnv, agent: L2FPPOAgent, args):
     print("1. Run export_to_firmware.py to generate actor.h")
     print("2. Build firmware with firmware/build_firmware.py")
     print("3. Flash cf2.bin to Crazyflie")
-    print("="*60)
+    plt.show()
 
 
 def play(env: CrazyflieL2FEnv, agent: L2FPPOAgent, checkpoint_path: str):
-    """Run trained policy with visualization."""
+    """Run trained policy with visualization and data logging."""
     iteration, best_reward = agent.load(checkpoint_path)
     print(f"\n[Play Mode] Loaded checkpoint from iteration {iteration}")
     print(f"[Play Mode] Best training reward: {best_reward:.3f}")
@@ -1142,6 +1148,19 @@ def play(env: CrazyflieL2FEnv, agent: L2FPPOAgent, checkpoint_path: str):
     step_count = 0
     episode_reward = 0.0
     
+    # Initialize logger
+    logger = FlightDataLogger()
+    
+    # Create eval directory structure with timestamp
+    run_tag = int(time.time())
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    eval_dir = os.path.join(script_dir, "eval", "hover", f"hover_{run_tag}")
+    os.makedirs(eval_dir, exist_ok=True)
+    
+    # File paths for periodic saving (overwrite each time)
+    csv_filename = os.path.join(eval_dir, "hover_eval_latest.csv")
+    title_prefix = "Hover Evaluation"
+    
     try:
         while simulation_app.is_running():
             action = agent.get_action(obs, deterministic=True)
@@ -1151,7 +1170,14 @@ def play(env: CrazyflieL2FEnv, agent: L2FPPOAgent, checkpoint_path: str):
             episode_reward += reward.mean().item()
             step_count += 1
             
-            if step_count % 100 == 0:
+            # Log flight data using FlightDataLogger
+            logger.log_step(env, env_idx=0)
+            
+            # Save every 500 steps
+            if step_count % 500 == 0:
+                print(f"[Step {step_count:5d}] Episode reward: {episode_reward:.2f} | Saving...")
+                logger.save_and_plot(csv_filename, title_prefix=title_prefix, output_dir=eval_dir)
+            elif step_count % 100 == 0:
                 print(f"[Step {step_count:5d}] Episode reward: {episode_reward:.2f}")
     
     except KeyboardInterrupt:

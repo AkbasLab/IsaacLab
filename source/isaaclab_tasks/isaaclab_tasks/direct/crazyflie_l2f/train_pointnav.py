@@ -43,6 +43,7 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 import gymnasium as gym
+import time
 
 # Isaac Sim setup - must happen before other imports
 from isaaclab.app import AppLauncher
@@ -92,6 +93,9 @@ from isaaclab.markers.config import CUBOID_MARKER_CFG
 
 # Import our custom Crazyflie configuration
 from crazyflie_21_cfg import CRAZYFLIE_21_CFG, CrazyflieL2FParams
+
+# Import flight evaluation utilities
+from flight_eval_utils import FlightDataLogger
 
 
 # ==============================================================================
@@ -1916,7 +1920,8 @@ def train(env: CrazyfliePointNavEnv, agent: L2FPPOAgent, args):
 
 
 def play(env: CrazyfliePointNavEnv, agent: L2FPPOAgent, checkpoint_path: str):
-    """Run trained policy with visualization."""
+    """Run trained policy with visualization and data logging."""
+    
     iteration, best_reward = agent.load(checkpoint_path)
     print(f"\n[Play Mode] Loaded checkpoint from iteration {iteration}")
     print(f"[Play Mode] Best training reward: {best_reward:.3f}")
@@ -1930,6 +1935,19 @@ def play(env: CrazyfliePointNavEnv, agent: L2FPPOAgent, checkpoint_path: str):
     reach_count = 0
     episode_count = 0
     
+    # Initialize flight data logger
+    logger = FlightDataLogger()
+    
+    # Create eval directory structure with timestamp
+    run_tag = int(time.time())
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    eval_dir = os.path.join(script_dir, "eval", "pointnav", f"pointnav_{run_tag}")
+    os.makedirs(eval_dir, exist_ok=True)
+    
+    # File paths for periodic saving (overwrite each time)
+    csv_filename = os.path.join(eval_dir, "pointnav_eval_latest.csv")
+    title_prefix = "Point Navigation Evaluation"
+    
     try:
         while simulation_app.is_running():
             action = agent.get_action(obs, deterministic=True)
@@ -1940,13 +1958,21 @@ def play(env: CrazyfliePointNavEnv, agent: L2FPPOAgent, checkpoint_path: str):
             episode_reward += reward.mean().item()
             step_count += 1
             
+            # Log flight data
+            logger.log_step(env, env_idx=0)
+            
             # Track reaches
             if done.any():
                 reaches = env._goal_reached[done].sum().item()
                 reach_count += reaches
                 episode_count += done.sum().item()
             
-            if step_count % 100 == 0:
+            # Save every 500 steps
+            if step_count % 500 == 0:
+                reach_rate = reach_count / max(episode_count, 1) * 100
+                print(f"[Step {step_count:5d}] Reward: {episode_reward:.2f} | Reach rate: {reach_rate:.1f}% | Saving...")
+                logger.save_and_plot(csv_filename, title_prefix=title_prefix, output_dir=eval_dir)
+            elif step_count % 100 == 0:
                 reach_rate = reach_count / max(episode_count, 1) * 100
                 print(f"[Step {step_count:5d}] Reward: {episode_reward:.2f} | Reach rate: {reach_rate:.1f}%")
     
