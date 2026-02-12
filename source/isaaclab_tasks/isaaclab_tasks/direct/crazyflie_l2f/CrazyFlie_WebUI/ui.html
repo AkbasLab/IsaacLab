@@ -1,0 +1,1099 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Crazyflie Web UI</title>
+  <style>
+    :root{
+      --bg:#0f1221; --panel:#141832; --accent:#6ee7ff; --accent2:#a78bfa; --ok:#34d399; --warn:#f59e0b; --bad:#fb7185;
+      --text:#e9ecff; --line:#1f2446;
+    }
+    *{box-sizing:border-box}
+    body{margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,"Helvetica Neue",Arial; background:linear-gradient(180deg,#0b0e1b, #11162f); color:var(--text)}
+    header{padding:14px 18px; border-bottom:1px solid var(--line); background:rgba(10,14,30,.7); backdrop-filter: blur(8px); position:sticky; top:0; z-index:10}
+    h1{margin:0; font-weight:750; font-size:18px; letter-spacing:.3px}
+    .wrap{max-width:1220px; margin:18px auto; padding:0 14px; display:grid; grid-template-columns:1.35fr .95fr; gap:14px}
+    .card{background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:12px}
+    .toolbar{display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:10px}
+    .btn{cursor:pointer; border:none; padding:10px 14px; border-radius:999px; font-weight:700; letter-spacing:.2px; transition:.15s transform, .15s opacity;}
+    .btn:active{transform:translateY(1px)}
+    .btn-primary{background:linear-gradient(90deg, var(--accent), var(--accent2)); color:#031220}
+    .btn-ghost{background:transparent; border:1px solid #2a2f58; color:#c9d0ff}
+    .btn-danger{background:rgba(251,113,133,.12); border:1px solid rgba(251,113,133,.45); color:#ffd6dd}
+    .badge{padding:6px 10px; border-radius:999px; font-weight:800; font-size:12px; border:1px solid #283066; background:#0e1535; color:#cfe7ff}
+    .badge.ok{border-color:rgba(52,211,153,.5); background:rgba(52,211,153,.08); color:#caffea}
+    .badge.bad{border-color:rgba(251,113,133,.55); background:rgba(251,113,133,.09); color:#ffd6dd}
+    .badge.warn{border-color:rgba(245,158,11,.6); background:rgba(245,158,11,.09); color:#ffe6b3}
+    .grid{display:grid; grid-template-columns:1fr 1fr; gap:10px}
+    .kv{display:flex; justify-content:space-between; gap:10px; padding:10px; background:#0e1431; border:1px solid #21264a; border-radius:10px}
+    .kv .label{opacity:.8}
+    .muted{opacity:.85}
+    .small{font-size:12px}
+    input, select{padding:9px 10px; border-radius:10px; border:1px solid #2a2f58; background:#0b0f26; color:var(--text); width:100%}
+    label{font-size:12px; color:#b8c0ff}
+    canvas{width:100%; height:auto; border-radius:12px; background:#0b0f26; border:1px solid #21264a; touch-action:none}
+    .legend{display:flex; gap:10px; align-items:center; margin-left:auto}
+    .dot{width:10px; height:10px; border-radius:50%}
+    .dot.target{background:var(--ok)}
+    .dot.actual{background:#f472b6}
+    .mono{font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;}
+    .tabs{display:flex; gap:8px; margin:8px 0 10px}
+    .tab{padding:8px 12px; border-radius:999px; border:1px solid #2a2f58; background:#0b0f26; color:#c9d0ff; font-weight:700; cursor:pointer}
+    .tab.active{background:linear-gradient(90deg, rgba(110,231,255,.16), rgba(167,139,250,.16)); border-color:rgba(110,231,255,.45)}
+    .row{display:flex; gap:10px; flex-wrap:wrap; align-items:center}
+    .right{margin-left:auto}
+    .mini-btn{padding:7px 10px; border-radius:999px; border:1px solid #2a2f58; background:#0b0f26; color:#c9d0ff; font-weight:700; cursor:pointer}
+    .mini-btn:active{transform:translateY(1px)}
+    .mini-danger{border-color:rgba(251,113,133,.55); background:rgba(251,113,133,.10); color:#ffd6dd}
+    .mini-ok{border-color:rgba(52,211,153,.55); background:rgba(52,211,153,.10); color:#caffea}
+    .split{display:grid; grid-template-columns:1fr; gap:14px}
+    @media (max-width:980px){ .wrap{grid-template-columns:1fr;} }
+
+    /* console panel */
+    .console-wrap{margin-top:14px}
+    .console-head{display:flex; gap:10px; align-items:center; margin:6px 4px 8px}
+    .console{height:220px; overflow:auto; background:#0b0f26; border:1px solid #21264a; border-radius:12px; padding:10px}
+    .logline{font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; line-height:1.35; white-space:pre-wrap; word-break:break-word; margin:0 0 6px}
+    .log-ok{color:#caffea}
+    .log-warn{color:#ffe6b3}
+    .log-error{color:#ffd6dd}
+    .log-info{color:#c9d0ff}
+  </style>
+</head>
+
+<body>
+<header>
+  <div class="row">
+    <h1>Crazyflie Web UI</h1>
+    <span id="statusBadge" class="badge bad">Disconnected</span>
+    <span id="uriBadge" class="badge mono">radio://…</span>
+    <div class="legend">
+      <div class="dot target"></div><span class="small">Target</span>
+      <div class="dot actual" style="margin-left:12px"></div><span class="small">Actual</span>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+  <!-- LEFT COLUMN -->
+  <section class="split">
+    <section class="card">
+      <div class="toolbar">
+        <button id="connectBtn" class="btn btn-primary">Connect</button>
+        <button id="disconnectBtn" class="btn btn-ghost">Disconnect</button>
+        <button id="stopBtn" class="btn btn-danger">STOP</button>
+
+        <div class="right row" style="gap:8px;">
+          <button id="clearXYBtn" class="btn btn-ghost">Clear XY Graph</button>
+
+          <button id="logStartBtn" class="btn btn-ghost">Start Log</button>
+          <button id="logStopBtn" class="btn btn-ghost">Stop Log</button>
+          <button id="logDownloadBtn" class="btn btn-ghost">Download CSV</button>
+          <span class="badge mono">Log: <span id="logState">stopped</span></span>
+
+          <label class="small muted" for="uriInput">URI</label>
+          <input id="uriInput" style="width:min(420px, 70vw)" value="radio://0/80/2M/E7E7E7E7E7"/>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <button id="deadmanBtn" class="btn btn-ghost">HOLD TO FLY (DEAD-MAN)</button>
+        <span id="deadmanState" class="badge warn">Not enabled</span>
+        <span class="badge mono">WS: <span id="wsState">closed</span></span>
+
+        <div class="right row" style="gap:10px; min-width:220px;">
+          <label class="small muted" for="trailLen">Trail</label>
+          <input id="trailLen" type="range" min="100" max="3000" value="1500" />
+        </div>
+      </div>
+
+      <canvas id="xyCanvas" width="980" height="560" aria-label="XY plot"></canvas>
+
+      <div class="small muted" style="margin-top:10px;">
+        XY plot uses meters → pixels mapping. Target is current commanded setpoint; Actual is from telemetry (stateEstimate).
+      </div>
+    </section>
+
+    <!-- FLIGHTPLAN -->
+    <section class="card">
+      <div class="row">
+        <h3 style="margin:6px 4px 6px">Flightplan</h3>
+        <div class="right row" style="gap:10px;">
+          <button id="sendPlanBtn" class="mini-btn mini-ok">Send Plan</button>
+          <button id="clearPlanBtn" class="mini-btn mini-danger">Clear</button>
+        </div>
+      </div>
+
+      <div class="tabs">
+        <button id="tabDraw" class="tab active">Draw</button>
+        <button id="tabPoints" class="tab">Points</button>
+      </div>
+
+      <div class="row" style="gap:10px; margin-bottom:10px;">
+        <button id="presetFig8Btn" class="mini-btn">Preset: Figure 8</button>
+        <span class="badge mono">Points: <span id="ptCount">0</span></span>
+        <span class="badge mono">Selected: <span id="selIdx">--</span></span>
+        <span class="badge mono">Mode: <span id="fpMode">draw</span></span>
+        <div class="right row" style="gap:10px;">
+          <button id="delSelectedBtn" class="mini-btn mini-danger">Delete Selected</button>
+        </div>
+      </div>
+
+      <canvas id="planCanvas" width="980" height="340" aria-label="Flightplan editor"></canvas>
+
+      <div class="grid" style="margin-top:10px;">
+        <div>
+          <label>Scale (m per 100px)</label>
+          <input id="scaleInput" type="number" step="0.05" value="0.50"/>
+        </div>
+        <div>
+          <label>Speed (m/s)</label>
+          <input id="speedInput" type="number" step="0.05" value="0.25"/>
+        </div>
+        <div>
+          <label>Plan Z (m)</label>
+          <input id="planZ" type="number" step="0.05" value="0.30"/>
+        </div>
+        <div>
+          <label>Loop</label>
+          <select id="loopSelect">
+            <option value="true">Loop</option>
+            <option value="false">No loop</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="small muted" style="margin-top:10px;">
+        <b>Draw tab:</b> click-drag to draw; points are auto-sampled & indexed.<br/>
+        <b>Points tab:</b> click to add numbered points, drag to move, click a point to select.
+      </div>
+    </section>
+  </section>
+
+  <!-- RIGHT COLUMN -->
+  <aside class="card">
+    <h3 style="margin:6px 4px 12px">Telemetry</h3>
+    <div class="grid">
+      <div class="kv"><span class="label">Mode</span><strong id="modeText" class="mono">idle</strong></div>
+      <div class="kv"><span class="label">Phase</span><strong id="phaseText" class="mono">idle</strong></div>
+      <div class="kv"><span class="label">Battery</span><strong id="batText" class="mono">--</strong></div>
+      <div class="kv"><span class="label">t</span><strong id="tText" class="mono">--</strong></div>
+    </div>
+
+    <h4 style="margin:14px 4px 8px" class="muted small">Target</h4>
+    <div class="grid">
+      <div class="kv"><span class="label">x</span><strong id="tx" class="mono">--</strong></div>
+      <div class="kv"><span class="label">y</span><strong id="ty" class="mono">--</strong></div>
+      <div class="kv"><span class="label">z</span><strong id="tz" class="mono">--</strong></div>
+      <div class="kv"><span class="label">yaw</span><strong id="tyaw" class="mono">--</strong></div>
+    </div>
+
+    <h4 style="margin:14px 4px 8px" class="muted small">Actual</h4>
+    <div class="grid">
+      <div class="kv"><span class="label">x</span><strong id="ax" class="mono">--</strong></div>
+      <div class="kv"><span class="label">y</span><strong id="ay" class="mono">--</strong></div>
+      <div class="kv"><span class="label">z</span><strong id="az" class="mono">--</strong></div>
+      <div class="kv"><span class="label">yaw</span><strong id="ayaw" class="mono">--</strong></div>
+    </div>
+
+    <hr style="border:0; border-top:1px solid var(--line); margin:14px 0"/>
+
+    <h3 style="margin:6px 4px 10px">Quick Commands</h3>
+    <div class="grid">
+      <div>
+        <label>Hover Z (m)</label>
+        <input id="hoverZ" type="number" step="0.05" value="0.30"/>
+      </div>
+      <div style="display:flex; align-items:end; gap:10px;">
+        <button id="hoverBtn" class="btn btn-ghost" style="width:100%">Hover</button>
+      </div>
+
+      <div>
+        <label>Nav X (m)</label>
+        <input id="navX" type="number" step="0.05" value="0.50"/>
+      </div>
+      <div>
+        <label>Nav Y (m)</label>
+        <input id="navY" type="number" step="0.05" value="0.00"/>
+      </div>
+      <div>
+        <label>Nav Z (m)</label>
+        <input id="navZ" type="number" step="0.05" value="0.30"/>
+      </div>
+      <div>
+        <label>Yaw (deg)</label>
+        <input id="navYaw" type="number" step="5" value="0"/>
+      </div>
+    </div>
+    <button id="navBtn" class="btn btn-ghost" style="margin-top:10px; width:100%">Navigate</button>
+
+    <!-- Console Log panel -->
+    <div class="console-wrap">
+      <div class="console-head">
+        <h3 style="margin:0 0 0 4px">Console Log</h3>
+        <span class="badge mono right">Lines: <span id="logLineCount">0</span></span>
+        <button id="clearConsoleBtn" class="mini-btn mini-danger">Clear</button>
+      </div>
+      <div id="consoleBox" class="console"></div>
+      <div class="small muted" style="margin:8px 4px 0">
+        Shows WS events + any server log messages (<span class="mono">type="log"</span>).
+      </div>
+    </div>
+  </aside>
+</main>
+
+<script>
+  // --------- Helpers ---------
+  const el = (id) => document.getElementById(id);
+  function fmt(v){ if(v === null || v === undefined || Number.isNaN(v)) return "--"; return Number(v).toFixed(2); }
+
+  // --------- Console Log ---------
+  const consoleBox = el("consoleBox");
+  const logLineCountEl = el("logLineCount");
+  const clearConsoleBtn = el("clearConsoleBtn");
+  let consoleLines = 0;
+  const MAX_CONSOLE_LINES = 400;
+
+  function levelClass(level){
+    const lv = String(level || "info").toLowerCase();
+    if(lv === "ok" || lv === "success") return "log-ok";
+    if(lv === "warn" || lv === "warning") return "log-warn";
+    if(lv === "error" || lv === "bad") return "log-error";
+    return "log-info";
+  }
+
+  function isDeadmanLog(text){
+    const s = String(text || "").toLowerCase();
+    return s.includes("deadman");
+  }
+
+  function addConsoleLine(text, level="info", ts=null){
+    if(isDeadmanLog(text)) return;
+
+    const line = document.createElement("div");
+    line.className = `logline ${levelClass(level)}`;
+    const stamp = ts ? `[${ts}] ` : "";
+    line.textContent = `${stamp}${text}`;
+    consoleBox.appendChild(line);
+    consoleLines++;
+    logLineCountEl.textContent = String(consoleLines);
+
+    while(consoleBox.children.length > MAX_CONSOLE_LINES){
+      consoleBox.removeChild(consoleBox.firstChild);
+      consoleLines--;
+      logLineCountEl.textContent = String(consoleLines);
+    }
+    consoleBox.scrollTop = consoleBox.scrollHeight;
+  }
+
+  function clearConsole(){
+    consoleBox.innerHTML = "";
+    consoleLines = 0;
+    logLineCountEl.textContent = "0";
+  }
+  clearConsoleBtn.onclick = clearConsole;
+
+  // --------- WS ---------
+  let ws = null, wsOpen = false;
+  const statusBadge = el("statusBadge");
+  const uriBadge = el("uriBadge");
+  const wsState = el("wsState");
+
+  function wsSend(obj){ if(wsOpen) ws.send(JSON.stringify(obj)); }
+
+  // Track connect transition so we only "arm/reset" once.
+  let prevConnected = false;
+
+  function connectWS(){
+    const proto = (location.protocol === "https:") ? "wss" : "ws";
+    ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+    ws.onopen = () => {
+      wsOpen = true;
+      wsState.textContent = "open";
+      wsState.style.color = "#caffea";
+      addConsoleLine("WebSocket opened", "ok", new Date().toLocaleTimeString());
+    };
+
+    ws.onclose = () => {
+      wsOpen = false;
+      wsState.textContent = "closed";
+      wsState.style.color = "#ffd6dd";
+      stopDeadman();
+      stopLogging();
+      prevConnected = false;
+      graphOriginArmed = false;
+      graphOriginLocked = false;
+      addConsoleLine("WebSocket closed", "warn", new Date().toLocaleTimeString());
+    };
+
+    ws.onerror = () => {
+      wsState.textContent = "error";
+      wsState.style.color = "#ffe6b3";
+      addConsoleLine("WebSocket error", "warn", new Date().toLocaleTimeString());
+    };
+
+    ws.onmessage = (ev) => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch { return; }
+
+      if(msg.type === "status"){
+        if(msg.uri) uriBadge.textContent = msg.uri;
+
+        const isConnected = !!msg.connected;
+
+        if(isConnected){
+          statusBadge.textContent = msg.msg ? `Connected (${msg.msg})` : "Connected";
+          statusBadge.className = "badge ok";
+
+          if(!prevConnected){
+            graphOriginArmed = true;
+            graphOriginLocked = false;
+            clearXYTrails();
+            addConsoleLine("Drone connected: graph origin will lock on first telemetry", "ok", new Date().toLocaleTimeString());
+          }
+        }else{
+          statusBadge.textContent = msg.msg ? `Disconnected (${msg.msg})` : "Disconnected";
+          statusBadge.className = "badge bad";
+          graphOriginArmed = false;
+          graphOriginLocked = false;
+        }
+
+        prevConnected = isConnected;
+      }
+
+      if(msg.type === "log"){
+        const text = msg.text ?? "(log)";
+        if(!isDeadmanLog(text)){
+          addConsoleLine(text, msg.level ?? "info", msg.ts ?? new Date().toLocaleTimeString());
+        }
+      }
+
+      if(msg.type === "telemetry"){
+        lastTelem = msg;
+        updateTelemetryUI(msg);
+        updateXYPlot(msg);
+        if(loggingEnabled) appendLogRow(msg);
+      }
+    };
+  }
+
+  // --------- Dead-man ---------
+  const deadmanBtn = el("deadmanBtn");
+  const deadmanState = el("deadmanState");
+  let deadmanHeld = false;
+  let deadmanTimer = null;
+
+  function setDeadmanUI(on){
+    if(on){
+      deadmanBtn.className = "btn btn-primary";
+      deadmanBtn.textContent = "HOLDING (DEAD-MAN ENABLED)";
+      deadmanState.textContent = "Enabled";
+      deadmanState.className = "badge ok";
+    }else{
+      deadmanBtn.className = "btn btn-ghost";
+      deadmanBtn.textContent = "HOLD TO FLY (DEAD-MAN)";
+      deadmanState.textContent = "Not enabled";
+      deadmanState.className = "badge warn";
+    }
+  }
+  function startDeadman(){
+    if(deadmanTimer) return;
+    deadmanTimer = setInterval(() => { if(deadmanHeld) wsSend({type:"deadman", enabled:true}); }, 100);
+    wsSend({type:"deadman", enabled:true});
+  }
+  function stopDeadman(){
+    if(deadmanTimer){ clearInterval(deadmanTimer); deadmanTimer = null; }
+    wsSend({type:"deadman", enabled:false});
+  }
+
+  deadmanBtn.addEventListener("pointerdown", (e) => { deadmanHeld = true; setDeadmanUI(true); startDeadman(); deadmanBtn.setPointerCapture(e.pointerId); });
+  deadmanBtn.addEventListener("pointerup", () => { deadmanHeld = false; setDeadmanUI(false); stopDeadman(); });
+  deadmanBtn.addEventListener("pointercancel", () => { deadmanHeld = false; setDeadmanUI(false); stopDeadman(); });
+
+  window.addEventListener("keydown", (e) => {
+    if(e.code === "Space"){
+      if(!deadmanHeld){ deadmanHeld = true; setDeadmanUI(true); startDeadman(); }
+      e.preventDefault();
+    }
+  });
+  window.addEventListener("keyup", (e) => {
+    if(e.code === "Space"){
+      deadmanHeld = false; setDeadmanUI(false); stopDeadman();
+      e.preventDefault();
+    }
+  });
+
+  // --------- Controls ---------
+  el("connectBtn").onclick = () => {
+    graphOriginArmed = true;
+    graphOriginLocked = false;
+    clearXYTrails();
+    addConsoleLine(`Connect requested: ${el("uriInput").value}`, "info", new Date().toLocaleTimeString());
+    wsSend({type:"connect", uri: el("uriInput").value});
+  };
+  el("disconnectBtn").onclick = () => { addConsoleLine("Disconnect requested", "warn", new Date().toLocaleTimeString()); wsSend({type:"disconnect"}); };
+  el("stopBtn").onclick = () => { addConsoleLine("STOP requested", "warn", new Date().toLocaleTimeString()); wsSend({type:"stop"}); };
+  el("hoverBtn").onclick = () => wsSend({type:"mode", mode:"hover", z: parseFloat(el("hoverZ").value)});
+  el("navBtn").onclick = () => wsSend({
+    type:"mode", mode:"navigate",
+    x: parseFloat(el("navX").value),
+    y: parseFloat(el("navY").value),
+    z: parseFloat(el("navZ").value),
+    yaw: parseFloat(el("navYaw").value)
+  });
+
+  // --------- Telemetry UI ---------
+  let lastTelem = null;
+
+  function updateTelemetryUI(msg){
+    el("modeText").textContent = msg.mode ?? "idle";
+    el("phaseText").textContent = msg.phase ?? "idle";
+    el("batText").textContent = msg.actual?.battery != null ? (msg.actual.battery.toFixed(2) + " V") : "--";
+    el("tText").textContent = msg.t ? (msg.t.toFixed(2)) : "--";
+
+    const a = msg.actual || {};
+    const t = msg.target || {};
+
+    el("tx").textContent = fmt(t.x);
+    el("ty").textContent = fmt(t.y);
+    el("tz").textContent = fmt(t.z);
+    el("tyaw").textContent = fmt(t.yaw);
+
+    el("ax").textContent = fmt(a.x);
+    el("ay").textContent = fmt(a.y);
+    el("az").textContent = fmt(a.z);
+    el("ayaw").textContent = fmt(a.yaw);
+  }
+
+  // ========= Canvas scaling + coordinates =========
+  function fitCanvasToCSS(canvas){
+    const dpr = window.devicePixelRatio || 1;
+    const r = canvas.getBoundingClientRect();
+    const w = Math.max(1, Math.round(r.width * dpr));
+    const h = Math.max(1, Math.round(r.height * dpr));
+    if(canvas.width !== w || canvas.height !== h){
+      canvas.width = w;
+      canvas.height = h;
+    }
+  }
+
+  function canvasPos(e, canvas){
+    const r = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / r.width;
+    const scaleY = canvas.height / r.height;
+    return { x: (e.clientX - r.left) * scaleX, y: (e.clientY - r.top) * scaleY };
+  }
+
+  // ========= Labeled grid drawing =========
+  const GRID_PX = 50;
+  const metersPerGrid = 0.25;
+
+  function drawGrid(ctx, canvas, metersPerGridLocal = null){
+    const w = canvas.width, h = canvas.height;
+    const gridPx = GRID_PX;
+    const mpg = (metersPerGridLocal ?? metersPerGrid);
+    const crisp = (v) => Math.round(v) + 0.5;
+
+    ctx.clearRect(0,0,w,h);
+    const g = ctx.createLinearGradient(0,0,0,h);
+    g.addColorStop(0,'#09122a');
+    g.addColorStop(1,'#0b1030');
+    ctx.fillStyle = g;
+    ctx.fillRect(0,0,w,h);
+
+    ctx.strokeStyle = '#1a2249';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for(let x=0; x<=w; x+=gridPx){
+      const cx = crisp(x);
+      ctx.moveTo(cx, 0);
+      ctx.lineTo(cx, h);
+    }
+    for(let y=0; y<=h; y+=gridPx){
+      const cy = crisp(y);
+      ctx.moveTo(0, cy);
+      ctx.lineTo(w, cy);
+    }
+    ctx.stroke();
+
+    const cx0 = crisp(w/2);
+    const cy0 = crisp(h/2);
+
+    ctx.strokeStyle = '#2c3a7a';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(cx0, 0); ctx.lineTo(cx0, h);
+    ctx.moveTo(0, cy0); ctx.lineTo(w, cy0);
+    ctx.stroke();
+
+    ctx.font = '12px ui-monospace, Menlo, Consolas, monospace';
+    ctx.fillStyle = 'rgba(233,236,255,.85)';
+    ctx.strokeStyle = 'rgba(3,18,32,.85)';
+    ctx.lineWidth = 4;
+
+    const stepsRight = Math.floor((w/2) / gridPx);
+    const stepsUp    = Math.floor((h/2) / gridPx);
+
+    for(let i=-stepsRight; i<=stepsRight; i++){
+      if(i === 0) continue;
+      const x = w/2 + i*gridPx;
+      const xm = (i * mpg).toFixed(2);
+
+      ctx.strokeStyle = 'rgba(44,58,122,.9)';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(crisp(x), cy0-6);
+      ctx.lineTo(crisp(x), cy0+6);
+      ctx.stroke();
+
+      ctx.lineWidth = 4;
+      ctx.strokeStyle = 'rgba(3,18,32,.85)';
+      ctx.strokeText(xm, x-12, (h/2)+22);
+      ctx.fillText(xm, x-12, (h/2)+22);
+    }
+
+    for(let j=-stepsUp; j<=stepsUp; j++){
+      if(j === 0) continue;
+      const y = h/2 + j*gridPx;
+      const ym = (-j * mpg).toFixed(2);
+
+      ctx.strokeStyle = 'rgba(44,58,122,.9)';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(cx0-6, crisp(y));
+      ctx.lineTo(cx0+6, crisp(y));
+      ctx.stroke();
+
+      ctx.lineWidth = 4;
+      ctx.strokeStyle = 'rgba(3,18,32,.85)';
+      ctx.strokeText(ym, (w/2)+10, y+4);
+      ctx.fillText(ym, (w/2)+10, y+4);
+    }
+
+    ctx.font = '12px system-ui, Segoe UI, Roboto, Arial';
+    ctx.fillStyle = 'rgba(201,208,255,.9)';
+    ctx.strokeStyle = 'rgba(3,18,32,.85)';
+    ctx.lineWidth = 4;
+
+    ctx.strokeText('X (m)', w - 52, (h/2) - 10);
+    ctx.fillText('X (m)', w - 52, (h/2) - 10);
+
+    ctx.strokeText('Y (m)', (w/2) + 10, 18);
+    ctx.fillText('Y (m)', (w/2) + 10, 18);
+
+    ctx.font = '12px ui-monospace, Menlo, Consolas, monospace';
+    ctx.fillStyle = 'rgba(233,236,255,.9)';
+    ctx.strokeStyle = 'rgba(3,18,32,.85)';
+    ctx.lineWidth = 4;
+    ctx.strokeText('0,0', (w/2)+10, (h/2)-10);
+    ctx.fillText('0,0', (w/2)+10, (h/2)-10);
+  }
+
+  // --------- XY Plot (origin-lock to start at 0,0) ---------
+  const xyCanvas = el("xyCanvas");
+  const xyCtx = xyCanvas.getContext("2d");
+  const trailLenEl = el("trailLen");
+  let trailTarget = [];
+  let trailActual = [];
+
+  let graphOrigin = { x: 0, y: 0 };
+  let graphOriginArmed = false;
+  let graphOriginLocked = false;
+
+  function clearXYTrails(){
+    trailTarget = [];
+    trailActual = [];
+    drawGrid(xyCtx, xyCanvas);
+  }
+
+  const clearXYBtn = document.getElementById("clearXYBtn");
+  if(clearXYBtn) clearXYBtn.onclick = () => { clearXYTrails(); addConsoleLine("XY graph cleared", "warn", new Date().toLocaleTimeString()); };
+
+  function m2p(canvas, mx, my, mpg = metersPerGrid){
+    const cx = canvas.width/2, cy = canvas.height/2;
+    const pxPerMeter = GRID_PX / mpg;
+    return { x: cx + mx*pxPerMeter, y: cy - my*pxPerMeter };
+  }
+
+  function drawTrail(ctx, points, color){
+    if(points.length < 2) return;
+    ctx.strokeStyle = color; ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(points[0].x, points[0].y);
+    for(let i=1;i<points.length;i++) ctx.lineTo(points[i].x, points[i].y);
+    ctx.stroke();
+  }
+
+  function drawDot(ctx, p, color){
+    ctx.fillStyle = color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, 5, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,.25)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(p.x, p.y, 9, 0, Math.PI*2); ctx.stroke();
+  }
+
+  function updateXYPlot(msg){
+    const t = msg.target || {};
+    const a = msg.actual || {};
+
+    if(graphOriginArmed && !graphOriginLocked && a.x != null && a.y != null){
+      graphOrigin = { x: a.x, y: a.y };
+      graphOriginLocked = true;
+      graphOriginArmed = false;
+      clearXYTrails();
+      addConsoleLine(`Graph origin locked at x=${Number(a.x).toFixed(2)}, y=${Number(a.y).toFixed(2)}`, "ok", new Date().toLocaleTimeString());
+    }
+
+    const ax = (a.x != null) ? (a.x - graphOrigin.x) : null;
+    const ay = (a.y != null) ? (a.y - graphOrigin.y) : null;
+    const tx = (t.x != null) ? (t.x - graphOrigin.x) : null;
+    const ty = (t.y != null) ? (t.y - graphOrigin.y) : null;
+
+    const tp = (tx != null && ty != null) ? m2p(xyCanvas, tx, ty) : null;
+    const ap = (ax != null && ay != null) ? m2p(xyCanvas, ax, ay) : null;
+
+    const maxTrail = parseInt(trailLenEl.value, 10);
+    if(tp){ trailTarget.push(tp); if(trailTarget.length > maxTrail) trailTarget.shift(); }
+    if(ap){ trailActual.push(ap); if(trailActual.length > maxTrail) trailActual.shift(); }
+
+    drawGrid(xyCtx, xyCanvas);
+    drawTrail(xyCtx, trailTarget, '#34d399');
+    drawTrail(xyCtx, trailActual, '#f472b6');
+
+    if(tp) drawDot(xyCtx, tp, '#34d399');
+    if(ap) drawDot(xyCtx, ap, '#f472b6');
+
+    if(tp && ap){
+      xyCtx.strokeStyle = '#f59e0b'; xyCtx.lineWidth = 2;
+      xyCtx.beginPath(); xyCtx.moveTo(ap.x, ap.y); xyCtx.lineTo(tp.x, tp.y); xyCtx.stroke();
+    }
+  }
+
+  // --------- CSV Logging (flight_logger-compatible + extras appended) ---------
+  // The FIRST 13 fields match flight_logger.py exactly, so plot_flight_data.py works unchanged:
+  // t, stateEstimate.{x,y,z}, acc.{x,y,z}, gyro.{x,y,z}, stabilizer.{roll,pitch,yaw}
+  //
+  // Then we append:
+  // target.{x,y,z,yaw}, pm.vbat,
+  // motor.m{1..4},
+  // imu.acc_{x,y,z}, imu.gyro_{x,y,z}, imu.mag_{x,y,z}
+
+  let loggingEnabled = false;
+  let logRows = [];
+  let logStartPerfS = null;     // performance-based start (seconds)
+  let logStartEpoch = null;     // for filename
+
+  const FLIGHT_LOG_FIELDS = [
+    // --- REQUIRED base (do not change order) ---
+    "t",
+    "stateEstimate.x","stateEstimate.y","stateEstimate.z",
+    "acc.x","acc.y","acc.z",
+    "gyro.x","gyro.y","gyro.z",
+    "stabilizer.roll","stabilizer.pitch","stabilizer.yaw",
+
+    // --- Extras appended ---
+    "target.x","target.y","target.z","target.yaw",
+    "pm.vbat",
+    "motor.m1","motor.m2","motor.m3","motor.m4",
+    "imu.acc_x","imu.acc_y","imu.acc_z",
+    "imu.gyro_x","imu.gyro_y","imu.gyro_z",
+    "imu.mag_x","imu.mag_y","imu.mag_z"
+  ];
+
+  function csvEscape(v){
+    if(v === null || v === undefined) return "";
+    const s = String(v);
+    if(/[",\n]/.test(s)) return `"${s.replace(/"/g,'""')}"`;
+    return s;
+  }
+
+  function numOrNan(v){
+    if(v === null || v === undefined || Number.isNaN(v)) return "nan";
+    const n = Number(v);
+    if(Number.isNaN(n)) return "nan";
+    return String(n);
+  }
+
+  function startLogging(){
+    if(loggingEnabled) return;
+    loggingEnabled = true;
+    logRows = [];
+    logStartPerfS = performance.now() / 1000.0;
+    logStartEpoch = Math.floor(Date.now() / 1000);
+
+    logRows.push(FLIGHT_LOG_FIELDS.join(","));
+
+    const ls = document.getElementById("logState");
+    if(ls) ls.textContent = "logging";
+    addConsoleLine("CSV logging started (flight_logger base + extras)", "ok", new Date().toLocaleTimeString());
+  }
+
+  function stopLogging(){
+    if(!loggingEnabled) return;
+    loggingEnabled = false;
+    const ls = document.getElementById("logState");
+    if(ls) ls.textContent = "stopped";
+    addConsoleLine("CSV logging stopped", "warn", new Date().toLocaleTimeString());
+  }
+
+  function appendLogRow(msg){
+    const raw = msg.raw || {};
+    const a = msg.actual || {};
+    const tg = msg.target || {};
+
+    // time since log start (like flight_logger.py)
+    const tRel = (performance.now() / 1000.0) - (logStartPerfS || (performance.now()/1000.0));
+
+    // Build row dict
+    const row = {
+      // --- Base required ---
+      "t": tRel,
+
+      "stateEstimate.x": (raw["stateEstimate.x"] != null) ? raw["stateEstimate.x"] : a.x,
+      "stateEstimate.y": (raw["stateEstimate.y"] != null) ? raw["stateEstimate.y"] : a.y,
+      "stateEstimate.z": (raw["stateEstimate.z"] != null) ? raw["stateEstimate.z"] : a.z,
+
+      "acc.x": raw["acc.x"],
+      "acc.y": raw["acc.y"],
+      "acc.z": raw["acc.z"],
+
+      "gyro.x": raw["gyro.x"],
+      "gyro.y": raw["gyro.y"],
+      "gyro.z": raw["gyro.z"],
+
+      "stabilizer.roll": raw["stabilizer.roll"],
+      "stabilizer.pitch": raw["stabilizer.pitch"],
+      "stabilizer.yaw": (raw["stabilizer.yaw"] != null) ? raw["stabilizer.yaw"] : a.yaw,
+
+      // --- Extras ---
+      "target.x": tg.x,
+      "target.y": tg.y,
+      "target.z": tg.z,
+      "target.yaw": tg.yaw,
+
+      "pm.vbat": raw["pm.vbat"],
+
+      "motor.m1": raw["motor.m1"],
+      "motor.m2": raw["motor.m2"],
+      "motor.m3": raw["motor.m3"],
+      "motor.m4": raw["motor.m4"],
+
+      "imu.acc_x": raw["imu.acc_x"],
+      "imu.acc_y": raw["imu.acc_y"],
+      "imu.acc_z": raw["imu.acc_z"],
+
+      "imu.gyro_x": raw["imu.gyro_x"],
+      "imu.gyro_y": raw["imu.gyro_y"],
+      "imu.gyro_z": raw["imu.gyro_z"],
+
+      "imu.mag_x": raw["imu.mag_x"],
+      "imu.mag_y": raw["imu.mag_y"],
+      "imu.mag_z": raw["imu.mag_z"]
+    };
+
+    const line = FLIGHT_LOG_FIELDS.map(k => csvEscape(numOrNan(row[k]))).join(",");
+    logRows.push(line);
+  }
+
+  function downloadLogCSV(){
+    if(logRows.length <= 1){
+      alert("No log data yet. Start logging first.");
+      return;
+    }
+    const csv = logRows.join("\n");
+    const blob = new Blob([csv], {type:"text/csv;charset=utf-8"});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+
+    const stamp = (logStartEpoch || Math.floor(Date.now()/1000));
+    a.href = url;
+    a.download = `flight_data_${stamp}.csv`;
+
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+
+    addConsoleLine(`CSV downloaded: flight_data_${stamp}.csv`, "ok", new Date().toLocaleTimeString());
+  }
+
+  const logStartBtn = document.getElementById("logStartBtn");
+  if(logStartBtn) logStartBtn.onclick = startLogging;
+  const logStopBtn = document.getElementById("logStopBtn");
+  if(logStopBtn) logStopBtn.onclick = stopLogging;
+  const logDownloadBtn = document.getElementById("logDownloadBtn");
+  if(logDownloadBtn) logDownloadBtn.onclick = downloadLogCSV;
+
+  // --------- Flightplan Editor (UNCHANGED) ---------
+  const planCanvas = el("planCanvas");
+  const planCtx = planCanvas.getContext("2d");
+
+  let fpMode = "draw";
+  el("fpMode").textContent = fpMode;
+
+  const tabDraw = el("tabDraw");
+  const tabPoints = el("tabPoints");
+
+  function setFPMode(mode){
+    fpMode = mode;
+    el("fpMode").textContent = mode;
+    if(mode === "draw"){
+      tabDraw.classList.add("active"); tabPoints.classList.remove("active");
+    }else{
+      tabPoints.classList.add("active"); tabDraw.classList.remove("active");
+    }
+    selectedIdx = -1;
+    draggingIdx = -1;
+    updatePlanHud();
+    redrawPlan();
+  }
+  tabDraw.onclick = () => setFPMode("draw");
+  tabPoints.onclick = () => setFPMode("points");
+
+  let drawPtsPx = [];
+  let ptsPx = [];
+  let selectedIdx = -1;
+  let draggingIdx = -1;
+
+  function updatePlanHud(){
+    el("ptCount").textContent = String(ptsPx.length);
+    el("selIdx").textContent = (selectedIdx >= 0) ? String(selectedIdx + 1) : "--";
+  }
+
+  function hitTestPoint(px, py, radius=12){
+    for(let i=ptsPx.length-1;i>=0;i--){
+      const p = ptsPx[i];
+      const d = Math.hypot(px - p.x, py - p.y);
+      if(d <= radius) return i;
+    }
+    return -1;
+  }
+
+  function resampleDrawToPoints(){
+    if(drawPtsPx.length < 2){ ptsPx = []; return; }
+    const maxPts = 80;
+    const step = Math.max(1, Math.floor(drawPtsPx.length / maxPts));
+    const sampled = [];
+    for(let i=0;i<drawPtsPx.length;i+=step) sampled.push(drawPtsPx[i]);
+    const last = drawPtsPx[drawPtsPx.length-1];
+    if(sampled.length === 0 || sampled[sampled.length-1] !== last) sampled.push(last);
+    ptsPx = sampled.map(p => ({x:p.x, y:p.y}));
+  }
+
+  function pxToMeters(px, py, scale_m_per_100px){
+    const cx = planCanvas.width/2, cy = planCanvas.height/2;
+    const s = scale_m_per_100px / 100.0;
+    const dx = px - cx;
+    const dy = py - cy;
+    return { x: dx * s, y: -dy * s };
+  }
+
+  function buildTimedWaypoints(pointsPx, scale, z, speed){
+    if(!pointsPx || pointsPx.length < 1) return [];
+    let t = 0.0;
+    const wps = [];
+    for(let i=0;i<pointsPx.length;i++){
+      const m = pxToMeters(pointsPx[i].x, pointsPx[i].y, scale);
+      if(i > 0){
+        const prevm = pxToMeters(pointsPx[i-1].x, pointsPx[i-1].y, scale);
+        const d = Math.hypot(m.x - prevm.x, m.y - prevm.y);
+        t += d / Math.max(0.05, speed);
+      }
+      wps.push({x:m.x, y:m.y, z:z, yaw:0.0, t:t});
+    }
+    return wps;
+  }
+
+  function redrawPlan(){
+    const mPer100 = parseFloat(el("scaleInput").value);
+    const metersPerGridPlan = mPer100 / 2;
+    drawGrid(planCtx, planCanvas, metersPerGridPlan);
+
+    if(fpMode === "draw" && drawPtsPx.length > 1){
+      planCtx.strokeStyle = 'rgba(201,208,255,.55)';
+      planCtx.lineWidth = 2;
+      planCtx.beginPath();
+      planCtx.moveTo(drawPtsPx[0].x, drawPtsPx[0].y);
+      for(let i=1;i<drawPtsPx.length;i++) planCtx.lineTo(drawPtsPx[i].x, drawPtsPx[i].y);
+      planCtx.stroke();
+    }
+
+    if(ptsPx.length > 1){
+      planCtx.strokeStyle = 'rgba(52,211,153,.55)';
+      planCtx.lineWidth = 2;
+      planCtx.beginPath();
+      planCtx.moveTo(ptsPx[0].x, ptsPx[0].y);
+      for(let i=1;i<ptsPx.length;i++) planCtx.lineTo(ptsPx[i].x, ptsPx[i].y);
+      planCtx.stroke();
+    }
+
+    for(let i=0;i<ptsPx.length;i++){
+      const p = ptsPx[i];
+      const isSel = (i === selectedIdx);
+
+      planCtx.fillStyle = isSel ? '#f59e0b' : '#34d399';
+      planCtx.beginPath(); planCtx.arc(p.x, p.y, isSel ? 7 : 5, 0, Math.PI*2); planCtx.fill();
+
+      planCtx.strokeStyle = 'rgba(255,255,255,.25)';
+      planCtx.lineWidth = 1;
+      planCtx.beginPath(); planCtx.arc(p.x, p.y, isSel ? 12 : 9, 0, Math.PI*2); planCtx.stroke();
+
+      planCtx.font = '12px ui-monospace, Menlo, Consolas, monospace';
+      planCtx.fillStyle = 'rgba(233,236,255,.95)';
+      planCtx.strokeStyle = 'rgba(3,18,32,.85)';
+      planCtx.lineWidth = 4;
+      const txt = String(i+1);
+      planCtx.strokeText(txt, p.x+10, p.y-10);
+      planCtx.fillText(txt, p.x+10, p.y-10);
+    }
+  }
+
+  let isDrawing = false;
+
+  planCanvas.addEventListener("pointerdown", (e) => {
+    const p = canvasPos(e, planCanvas);
+
+    if(fpMode === "draw"){
+      isDrawing = true;
+      drawPtsPx = [];
+      ptsPx = [];
+      selectedIdx = -1;
+      draggingIdx = -1;
+      drawPtsPx.push({x:p.x, y:p.y});
+      planCanvas.setPointerCapture(e.pointerId);
+      resampleDrawToPoints();
+      updatePlanHud();
+      redrawPlan();
+      return;
+    }
+
+    const hit = hitTestPoint(p.x, p.y);
+    if(hit >= 0){
+      selectedIdx = hit;
+      draggingIdx = hit;
+      planCanvas.setPointerCapture(e.pointerId);
+      updatePlanHud();
+      redrawPlan();
+    }else{
+      ptsPx.push({x:p.x, y:p.y});
+      selectedIdx = ptsPx.length - 1;
+      draggingIdx = selectedIdx;
+      planCanvas.setPointerCapture(e.pointerId);
+      updatePlanHud();
+      redrawPlan();
+    }
+  });
+
+  planCanvas.addEventListener("pointermove", (e) => {
+    const p = canvasPos(e, planCanvas);
+
+    if(fpMode === "draw"){
+      if(!isDrawing) return;
+      drawPtsPx.push({x:p.x, y:p.y});
+      if(drawPtsPx.length > 1600) drawPtsPx.shift();
+      resampleDrawToPoints();
+      updatePlanHud();
+      redrawPlan();
+      return;
+    }
+
+    if(draggingIdx >= 0){
+      ptsPx[draggingIdx] = {x:p.x, y:p.y};
+      redrawPlan();
+    }
+  });
+
+  planCanvas.addEventListener("pointerup", () => {
+    isDrawing = false;
+    draggingIdx = -1;
+    redrawPlan();
+  });
+  planCanvas.addEventListener("pointercancel", () => {
+    isDrawing = false;
+    draggingIdx = -1;
+    redrawPlan();
+  });
+
+  el("delSelectedBtn").onclick = () => {
+    if(selectedIdx < 0) return;
+    ptsPx.splice(selectedIdx, 1);
+    selectedIdx = Math.min(selectedIdx, ptsPx.length - 1);
+    draggingIdx = -1;
+    updatePlanHud();
+    redrawPlan();
+  };
+
+  el("clearPlanBtn").onclick = () => {
+    drawPtsPx = [];
+    ptsPx = [];
+    selectedIdx = -1;
+    draggingIdx = -1;
+    updatePlanHud();
+    redrawPlan();
+  };
+
+  el("sendPlanBtn").onclick = () => {
+    const scale = parseFloat(el("scaleInput").value);
+    const speed = parseFloat(el("speedInput").value);
+    const z = parseFloat(el("planZ").value);
+    const loop = (el("loopSelect").value === "true");
+    const wps = buildTimedWaypoints(ptsPx, scale, z, speed);
+    wsSend({type:"plan", waypoints:wps, loop:loop});
+  };
+
+  function presetFigure8(){
+    const z = parseFloat(el("planZ").value);
+    const amp = 0.5;
+    const N = 70;
+
+    const meterPts = [];
+    for(let i=0;i<=N;i++){
+      const u = i / N;
+      const s = u * 2*Math.PI;
+      const x = amp * Math.sin(s);
+      const y = (amp*0.5) * Math.sin(s) * Math.cos(s);
+      meterPts.push({x,y});
+    }
+
+    const scale_m_per_100px = parseFloat(el("scaleInput").value);
+    const s = scale_m_per_100px / 100.0;
+    const cx = planCanvas.width/2, cy = planCanvas.height/2;
+
+    ptsPx = meterPts.map(m => ({ x: cx + (m.x / s), y: cy - (m.y / s) }));
+    drawPtsPx = ptsPx.slice();
+    selectedIdx = -1; draggingIdx = -1;
+
+    updatePlanHud();
+    redrawPlan();
+
+    const speed = parseFloat(el("speedInput").value);
+    const wps = buildTimedWaypoints(ptsPx, scale_m_per_100px, z, speed);
+    wsSend({type:"plan", waypoints:wps, loop:true});
+  }
+  el("presetFig8Btn").onclick = presetFigure8;
+
+  // ========= Resize handling =========
+  function resizeAllCanvases(){
+    fitCanvasToCSS(xyCanvas);
+    fitCanvasToCSS(planCanvas);
+    drawGrid(xyCtx, xyCanvas);
+    redrawPlan();
+  }
+
+  // --------- Init ---------
+  setDeadmanUI(false);
+  connectWS();
+
+  window.addEventListener("resize", resizeAllCanvases);
+  resizeAllCanvases();
+
+  updatePlanHud();
+  redrawPlan();
+  setFPMode("draw");
+
+  addConsoleLine("UI ready", "ok", new Date().toLocaleTimeString());
+</script>
+
+</body>
+</html>
