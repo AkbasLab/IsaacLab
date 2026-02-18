@@ -45,6 +45,26 @@ def quat_to_euler(quat: torch.Tensor) -> torch.Tensor:
     return torch.stack([roll, pitch, yaw], dim=-1) * 180.0 / torch.pi
 
 
+def load_csv_as_dict(filename: str) -> dict:
+    """Load CSV data into a dictionary of numpy arrays (no pandas dependency).
+    
+    Args:
+        filename: Path to CSV file
+        
+    Returns:
+        Dictionary mapping column names to numpy arrays
+    """
+    data = {}
+    with open(filename, 'r', newline='') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            for key, value in row.items():
+                if key not in data:
+                    data[key] = []
+                data[key].append(float(value))
+    return {key: np.array(values) for key, values in data.items()}
+
+
 def plot_flight_data(filename: str, title_prefix: str = "Flight", output_dir: Optional[str] = None):
     """Plot flight data from CSV file and save as JPG images.
     
@@ -59,9 +79,7 @@ def plot_flight_data(filename: str, title_prefix: str = "Flight", output_dir: Op
         title_prefix: Prefix for plot titles (e.g., "Hover", "Point Navigation")
         output_dir: Directory to save plots as JPG files. If None, plots are displayed.
     """
-    import pandas as pd
-    
-    df = pd.read_csv(filename)
+    df = load_csv_as_dict(filename)
     
     t = df["t"]
     
@@ -292,3 +310,92 @@ class FlightDataLogger:
             except Exception as e:
                 print(f"Failed to generate plots: {e}")
         return saved_file
+
+
+def plot_motor_data(filename: str, title_prefix: str = "Flight", output_dir: Optional[str] = None,
+                    hover_rpm: float = 7249.0, mass: float = 0.027, gravity: float = 9.81):
+    """Plot motor RPM and thrust data from CSV file.
+    
+    Args:
+        filename: Path to CSV file containing motor data
+        title_prefix: Prefix for plot titles
+        output_dir: Directory to save plots. If None, plots are displayed.
+        hover_rpm: Expected hover RPM for reference line
+        mass: Drone mass in kg for thrust reference
+        gravity: Gravitational acceleration in m/s^2
+    """
+    df = load_csv_as_dict(filename)
+    t = df["t"]
+    
+    # Check if motor columns exist (supports both formats: motor.m1 and motor.rpm.m1)
+    motor_cols_new = ["motor.m1", "motor.m2", "motor.m3", "motor.m4"]
+    motor_cols_old = ["motor.rpm.m1", "motor.rpm.m2", "motor.rpm.m3", "motor.rpm.m4"]
+    
+    if all(col in df for col in motor_cols_new):
+        motor_cols = motor_cols_new
+    elif all(col in df for col in motor_cols_old):
+        motor_cols = motor_cols_old
+    else:
+        print("Warning: Motor data columns not found in CSV. Skipping motor plots.")
+        return
+    
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    
+    # --- Plot Motor RPM ---
+    plt.figure(figsize=(12, 6))
+    plt.plot(t, df[motor_cols[0]], label="M1 (FR)", linewidth=1)
+    plt.plot(t, df[motor_cols[1]], label="M2 (BR)", linewidth=1)
+    plt.plot(t, df[motor_cols[2]], label="M3 (BL)", linewidth=1)
+    plt.plot(t, df[motor_cols[3]], label="M4 (FL)", linewidth=1)
+    plt.axhline(y=hover_rpm, color='r', linestyle='--', label=f'Hover RPM ({hover_rpm:.0f})', alpha=0.5)
+    plt.title(f"{title_prefix} - Motor RPM")
+    plt.xlabel("Time [s]")
+    plt.ylabel("RPM")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    if output_dir:
+        plt.savefig(os.path.join(output_dir, f"{title_prefix.lower().replace(' ', '_')}_motor_rpm.jpg"), 
+                    dpi=150, bbox_inches='tight')
+        plt.close()
+    
+    # --- Plot Motor Thrust ---
+    thrust_cols = ["motor.thrust.m1", "motor.thrust.m2", "motor.thrust.m3", "motor.thrust.m4"]
+    if all(col in df for col in thrust_cols):
+        plt.figure(figsize=(12, 6))
+        plt.plot(t, df["motor.thrust.m1"] * 1000, label="M1 (FR)", linewidth=1)
+        plt.plot(t, df["motor.thrust.m2"] * 1000, label="M2 (BR)", linewidth=1)
+        plt.plot(t, df["motor.thrust.m3"] * 1000, label="M3 (BL)", linewidth=1)
+        plt.plot(t, df["motor.thrust.m4"] * 1000, label="M4 (FL)", linewidth=1)
+        hover_thrust = mass * gravity / 4.0 * 1000  # mN per motor
+        plt.axhline(y=hover_thrust, color='r', linestyle='--', 
+                    label=f'Hover thrust ({hover_thrust:.1f} mN)', alpha=0.5)
+        plt.title(f"{title_prefix} - Motor Thrust")
+        plt.xlabel("Time [s]")
+        plt.ylabel("Thrust [mN]")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        if output_dir:
+            plt.savefig(os.path.join(output_dir, f"{title_prefix.lower().replace(' ', '_')}_motor_thrust.jpg"),
+                        dpi=150, bbox_inches='tight')
+            plt.close()
+    
+    # --- Plot Total Thrust ---
+    if "motor.thrust.total" in df:
+        plt.figure(figsize=(12, 6))
+        plt.plot(t, df["motor.thrust.total"] * 1000, label="Total Thrust", 
+                 color="purple", linewidth=1.5)
+        weight = mass * gravity * 1000  # mN
+        plt.axhline(y=weight, color='r', linestyle='--', 
+                    label=f'Weight ({weight:.1f} mN)', alpha=0.5)
+        plt.title(f"{title_prefix} - Total Thrust vs Weight")
+        plt.xlabel("Time [s]")
+        plt.ylabel("Force [mN]")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        if output_dir:
+            plt.savefig(os.path.join(output_dir, f"{title_prefix.lower().replace(' ', '_')}_total_thrust.jpg"),
+                        dpi=150, bbox_inches='tight')
+            plt.close()
+        else:
+            plt.show()

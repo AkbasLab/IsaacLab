@@ -19,6 +19,12 @@ checkpoints/final_model.pt
 # Generated files
 calibration_report.json
 
+# Evaluation outputs
+play_eval_results/
+eval/
+*.jpg
+*.png
+
 # IDE
 .vscode/
 .idea/

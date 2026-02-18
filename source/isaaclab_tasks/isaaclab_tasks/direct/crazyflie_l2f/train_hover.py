@@ -60,14 +60,35 @@ def parse_args():
     # AppLauncher adds its own args (including --headless)
     AppLauncher.add_app_launcher_args(parser)
     
-    args = parser.parse_args()
+    # Use parse_known_args to allow this module to be imported by other scripts
+    args, _ = parser.parse_known_args()
     return args
 
 
-# Parse args and launch Isaac Sim
-args = parse_args()
-app_launcher = AppLauncher(args)
-simulation_app = app_launcher.app
+# Check if Isaac Sim is already running (i.e., we're being imported by another script)
+def _is_isaac_sim_running():
+    """Check if Isaac Sim/Omniverse is already initialized."""
+    try:
+        import carb
+        return carb.get_framework() is not None
+    except (ImportError, AttributeError):
+        return False
+
+# Only initialize AppLauncher if Isaac Sim isn't already running
+if _is_isaac_sim_running():
+    # Being imported by another script that already initialized Isaac Sim
+    args = parse_args()
+    # Get simulation_app reference
+    try:
+        import omni.kit.app
+        simulation_app = omni.kit.app.get_app()
+    except:
+        simulation_app = None
+else:
+    # We're the main entry point - initialize Isaac Sim
+    args = parse_args()
+    app_launcher = AppLauncher(args)
+    simulation_app = app_launcher.app
 
 # Now import Isaac Lab modules
 import isaaclab.sim as sim_utils
