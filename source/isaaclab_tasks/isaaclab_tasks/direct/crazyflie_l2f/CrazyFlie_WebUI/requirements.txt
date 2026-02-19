@@ -1,0 +1,9 @@
+# Web server + websocket support
+fastapi
+uvicorn[standard]
+
+# Crazyflie Python library
+cflib
+
+# (Optional but common) numeric helpers if you later add smoothing/filters
+numpy

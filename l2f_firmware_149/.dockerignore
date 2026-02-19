@@ -1,0 +1,10 @@
+.git
+external/rl_tools/docs
+external/rl_tools/media
+external/rl_tools/tests
+external/rl_tools/redistributable
+external/rl_tools/embedded_platforms
+external/crazyflie_firmware/.git
+*.bin
+*.o
+build/

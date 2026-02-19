@@ -79,3 +79,12 @@ tests/
 # Misc
 /2.7.0+cu128
 
+/.venv
+/checkpoints*/
+/CrazyFlie_WebUI/
+# Nested git repo with its own submodules
+temp_l2f_controller/
+
+# Large firmware external dependencies
+l2f_firmware_149/external/
+l2f_firmware_149/build_firmware/

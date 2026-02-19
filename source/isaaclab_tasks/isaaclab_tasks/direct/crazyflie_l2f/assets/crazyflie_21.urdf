@@ -1,0 +1,255 @@
+<?xml version="1.0"?>
+<!--
+  Crazyflie 2.1 URDF for Isaac Lab
+  
+  Parameters based on Learning to Fly (L2F) project specifications:
+  - Mass: 27g (0.027 kg) - ALL mass concentrated in body link
+  - Arm length: 28mm (motor to center, X-config)
+  - Inertia from L2F: Ixx=Iyy=3.85e-6, Izz=5.9675e-6 kg·m²
+  
+  Physical dimensions (approximate):
+  - Body: 92mm motor-to-motor diagonal
+  - Height: ~29mm (including motors)
+  - Propeller diameter: 45mm
+-->
+<robot name="crazyflie_21">
+
+  <!-- ============================================== -->
+  <!-- Main Body (includes battery, PCB, frame)      -->
+  <!-- ALL mass is here to match L2F's 27g           -->
+  <!-- ============================================== -->
+  <link name="body">
+    <inertial>
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <mass value="0.027"/>
+      <!-- Inertia from L2F crazy_flie.h -->
+      <inertia 
+        ixx="3.85e-6" ixy="0.0" ixz="0.0" 
+        iyy="3.85e-6" iyz="0.0" 
+        izz="5.9675e-6"/>
+    </inertial>
+    <visual>
+      <!-- Central body (PCB + battery) approximated as box -->
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <box size="0.03 0.03 0.012"/>
+      </geometry>
+      <material name="black">
+        <color rgba="0.1 0.1 0.1 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <box size="0.03 0.03 0.012"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- ============================================== -->
+  <!-- Motor Arms (X-configuration)                   -->
+  <!-- Arm positions: ±0.028m on X and Y axes        -->
+  <!-- ============================================== -->
+  
+  <!-- Arm 1: Front-Right (+X, -Y) -->
+  <link name="arm1">
+    <inertial>
+      <origin xyz="0.014 -0.014 0.0" rpy="0.0 0.0 -0.785398"/>
+      <mass value="0.0"/>
+      <inertia ixx="1e-9" ixy="0.0" ixz="0.0" iyy="1e-9" iyz="0.0" izz="1e-9"/>
+    </inertial>
+    <visual>
+      <origin xyz="0.014 -0.014 0.0" rpy="0.0 0.0 -0.785398"/>
+      <geometry>
+        <box size="0.04 0.005 0.003"/>
+      </geometry>
+      <material name="white">
+        <color rgba="0.9 0.9 0.9 1.0"/>
+      </material>
+    </visual>
+  </link>
+  
+  <joint name="arm1_joint" type="fixed">
+    <parent link="body"/>
+    <child link="arm1"/>
+    <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+  </joint>
+
+  <!-- Arm 2: Front-Left (-X, -Y) -->
+  <link name="arm2">
+    <inertial>
+      <origin xyz="-0.014 -0.014 0.0" rpy="0.0 0.0 0.785398"/>
+      <mass value="0.0"/>
+      <inertia ixx="1e-9" ixy="0.0" ixz="0.0" iyy="1e-9" iyz="0.0" izz="1e-9"/>
+    </inertial>
+    <visual>
+      <origin xyz="-0.014 -0.014 0.0" rpy="0.0 0.0 0.785398"/>
+      <geometry>
+        <box size="0.04 0.005 0.003"/>
+      </geometry>
+      <material name="white">
+        <color rgba="0.9 0.9 0.9 1.0"/>
+      </material>
+    </visual>
+  </link>
+  
+  <joint name="arm2_joint" type="fixed">
+    <parent link="body"/>
+    <child link="arm2"/>
+    <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+  </joint>
+
+  <!-- Arm 3: Back-Left (-X, +Y) -->
+  <link name="arm3">
+    <inertial>
+      <origin xyz="-0.014 0.014 0.0" rpy="0.0 0.0 -0.785398"/>
+      <mass value="0.0"/>
+      <inertia ixx="1e-9" ixy="0.0" ixz="0.0" iyy="1e-9" iyz="0.0" izz="1e-9"/>
+    </inertial>
+    <visual>
+      <origin xyz="-0.014 0.014 0.0" rpy="0.0 0.0 -0.785398"/>
+      <geometry>
+        <box size="0.04 0.005 0.003"/>
+      </geometry>
+      <material name="white">
+        <color rgba="0.9 0.9 0.9 1.0"/>
+      </material>
+    </visual>
+  </link>
+  
+  <joint name="arm3_joint" type="fixed">
+    <parent link="body"/>
+    <child link="arm3"/>
+    <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+  </joint>
+
+  <!-- Arm 4: Back-Right (+X, +Y) -->
+  <link name="arm4">
+    <inertial>
+      <origin xyz="0.014 0.014 0.0" rpy="0.0 0.0 0.785398"/>
+      <mass value="0.0"/>
+      <inertia ixx="1e-9" ixy="0.0" ixz="0.0" iyy="1e-9" iyz="0.0" izz="1e-9"/>
+    </inertial>
+    <visual>
+      <origin xyz="0.014 0.014 0.0" rpy="0.0 0.0 0.785398"/>
+      <geometry>
+        <box size="0.04 0.005 0.003"/>
+      </geometry>
+      <material name="white">
+        <color rgba="0.9 0.9 0.9 1.0"/>
+      </material>
+    </visual>
+  </link>
+  
+  <joint name="arm4_joint" type="fixed">
+    <parent link="body"/>
+    <child link="arm4"/>
+    <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+  </joint>
+
+  <!-- ============================================== -->
+  <!-- Motors with spinning propellers               -->
+  <!-- Motor positions from L2F: ±0.028m             -->
+  <!-- ============================================== -->
+
+  <!-- Motor 1: Front-Right (+0.028, -0.028) - CCW -->
+  <link name="m1_prop">
+    <inertial>
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <mass value="0.00001"/>
+      <inertia ixx="1e-9" ixy="0.0" ixz="0.0" iyy="1e-9" iyz="0.0" izz="1e-9"/>
+    </inertial>
+    <visual>
+      <origin xyz="0.0 0.0 0.003" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <cylinder length="0.006" radius="0.0225"/>
+      </geometry>
+      <material name="prop_ccw">
+        <color rgba="0.2 0.6 0.2 0.7"/>
+      </material>
+    </visual>
+  </link>
+  
+  <joint name="m1_joint" type="continuous">
+    <parent link="body"/>
+    <child link="m1_prop"/>
+    <origin xyz="0.028 -0.028 0.006" rpy="0.0 0.0 0.0"/>
+    <axis xyz="0.0 0.0 1.0"/>
+  </joint>
+
+  <!-- Motor 2: Front-Left (-0.028, -0.028) - CW -->
+  <link name="m2_prop">
+    <inertial>
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <mass value="0.00001"/>
+      <inertia ixx="1e-9" ixy="0.0" ixz="0.0" iyy="1e-9" iyz="0.0" izz="1e-9"/>
+    </inertial>
+    <visual>
+      <origin xyz="0.0 0.0 0.003" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <cylinder length="0.006" radius="0.0225"/>
+      </geometry>
+      <material name="prop_cw">
+        <color rgba="0.6 0.2 0.2 0.7"/>
+      </material>
+    </visual>
+  </link>
+  
+  <joint name="m2_joint" type="continuous">
+    <parent link="body"/>
+    <child link="m2_prop"/>
+    <origin xyz="-0.028 -0.028 0.006" rpy="0.0 0.0 0.0"/>
+    <axis xyz="0.0 0.0 1.0"/>
+  </joint>
+
+  <!-- Motor 3: Back-Left (-0.028, +0.028) - CCW -->
+  <link name="m3_prop">
+    <inertial>
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <mass value="0.00001"/>
+      <inertia ixx="1e-9" ixy="0.0" ixz="0.0" iyy="1e-9" iyz="0.0" izz="1e-9"/>
+    </inertial>
+    <visual>
+      <origin xyz="0.0 0.0 0.003" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <cylinder length="0.006" radius="0.0225"/>
+      </geometry>
+      <material name="prop_ccw">
+        <color rgba="0.2 0.6 0.2 0.7"/>
+      </material>
+    </visual>
+  </link>
+  
+  <joint name="m3_joint" type="continuous">
+    <parent link="body"/>
+    <child link="m3_prop"/>
+    <origin xyz="-0.028 0.028 0.006" rpy="0.0 0.0 0.0"/>
+    <axis xyz="0.0 0.0 1.0"/>
+  </joint>
+
+  <!-- Motor 4: Back-Right (+0.028, +0.028) - CW -->
+  <link name="m4_prop">
+    <inertial>
+      <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+      <mass value="0.00001"/>
+      <inertia ixx="1e-9" ixy="0.0" ixz="0.0" iyy="1e-9" iyz="0.0" izz="1e-9"/>
+    </inertial>
+    <visual>
+      <origin xyz="0.0 0.0 0.003" rpy="0.0 0.0 0.0"/>
+      <geometry>
+        <cylinder length="0.006" radius="0.0225"/>
+      </geometry>
+      <material name="prop_cw">
+        <color rgba="0.6 0.2 0.2 0.7"/>
+      </material>
+    </visual>
+  </link>
+  
+  <joint name="m4_joint" type="continuous">
+    <parent link="body"/>
+    <child link="m4_prop"/>
+    <origin xyz="0.028 0.028 0.006" rpy="0.0 0.0 0.0"/>
+    <axis xyz="0.0 0.0 1.0"/>
+  </joint>
+
+</robot>

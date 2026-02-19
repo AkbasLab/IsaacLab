@@ -1,0 +1,43 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Build outputs
+build_firmware/
+*.bin
+*.hex
+*.elf
+*.map
+
+# Checkpoints (keep only best_model.pt in repo)
+checkpoints/checkpoint_*.pt
+checkpoints/final_model.pt
+
+# Generated files
+calibration_report.json
+
+# Evaluation outputs
+play_eval_results/
+eval/
+*.jpg
+*.png
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+checkpoints/
+checkpoints_nav/
