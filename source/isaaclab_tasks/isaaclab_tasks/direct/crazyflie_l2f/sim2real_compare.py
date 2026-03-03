@@ -307,6 +307,10 @@ def main():
     parser.add_argument("--t_offset", type=float, default=0.0,
                         help="Time offset to add to real data (seconds). "
                              "Use this to manually align start times if needed.")
+    parser.add_argument("--trim_idle", action="store_true", default=True,
+                        help="Auto-trim idle rows from real data where motors are zero (default: True)")
+    parser.add_argument("--no_trim_idle", action="store_false", dest="trim_idle",
+                        help="Disable auto-trim of idle rows")
     parser.add_argument("--no_plot", action="store_true", help="Skip plot generation")
     args = parser.parse_args()
     
@@ -322,6 +326,27 @@ def main():
     if "t" not in sim_raw or "t" not in real_raw:
         print("ERROR: Both CSVs must have a 't' (time) column.")
         sys.exit(1)
+    
+    # Auto-trim idle rows from real data (motors = 0 means drone wasn't flying)
+    if args.trim_idle and "motor.m1" in real_raw:
+        motor_sum = np.zeros(len(real_raw["t"]))
+        for mc in ["motor.m1", "motor.m2", "motor.m3", "motor.m4"]:
+            if mc in real_raw:
+                motor_sum += np.nan_to_num(real_raw[mc], nan=0.0)
+        flying_mask = motor_sum > 0
+        n_before = len(real_raw["t"])
+        if flying_mask.any():
+            for col in real_raw:
+                real_raw[col] = real_raw[col][flying_mask]
+            n_after = len(real_raw["t"])
+            print(f"\nAuto-trimmed idle rows: {n_before} → {n_after} "
+                  f"(removed {n_before - n_after} rows where motors=0)")
+        else:
+            print("\nWARNING: All motor values are zero — drone may not have been flying!")
+    
+    # Reset both time series to start at 0
+    sim_raw["t"] = sim_raw["t"] - sim_raw["t"][0]
+    real_raw["t"] = real_raw["t"] - real_raw["t"][0]
     
     # Apply time offset to real data
     t_real = real_raw["t"] + args.t_offset

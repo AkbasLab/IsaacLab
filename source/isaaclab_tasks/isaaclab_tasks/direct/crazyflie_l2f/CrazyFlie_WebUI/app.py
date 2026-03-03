@@ -703,8 +703,10 @@ def _send_loop() -> None:
         try:
             if STATE.mode == "hover":
                 STATE.phase = "hover"
-                STATE.target.x = None
-                STATE.target.y = None
+                # Hover holds current XY; log actual position as target for sim2real comparison
+                a = STATE.telemetry
+                STATE.target.x = a.x if a.x is not None else 0.0
+                STATE.target.y = a.y if a.y is not None else 0.0
                 STATE.target.z = float(STATE.hover_z)
                 STATE.target.yaw = 0.0
 
