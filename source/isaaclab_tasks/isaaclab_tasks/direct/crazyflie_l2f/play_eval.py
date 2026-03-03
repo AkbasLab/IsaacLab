@@ -163,10 +163,39 @@ class L2FConstants:
 # Extended Flight Data Logger with Motor Data
 # ==============================================================================
 
+# Shared CSV column order — identical to WebUI ui.html FLIGHT_LOG_FIELDS + sim extras.
+# Any comparison tool can rely on these columns existing in both sim and real CSVs.
+SHARED_CSV_FIELDS = [
+    # --- Base required (matches flight_logger.py / WebUI order) ---
+    "t",
+    "stateEstimate.x", "stateEstimate.y", "stateEstimate.z",
+    "acc.x", "acc.y", "acc.z",
+    "gyro.x", "gyro.y", "gyro.z",
+    "stabilizer.roll", "stabilizer.pitch", "stabilizer.yaw",
+    # --- Target ---
+    "target.x", "target.y", "target.z", "target.yaw",
+    # --- Battery (real-only; sim writes simulated nominal) ---
+    "pm.vbat",
+    # --- Motors ---
+    "motor.m1", "motor.m2", "motor.m3", "motor.m4",
+    # --- Raw IMU (real best-effort; sim mirrors filtered) ---
+    "imu.acc_x", "imu.acc_y", "imu.acc_z",
+    "imu.gyro_x", "imu.gyro_y", "imu.gyro_z",
+    "imu.mag_x", "imu.mag_y", "imu.mag_z",
+    # --- Sim-only extras (real CSVs will have NaN) ---
+    "velocity.x", "velocity.y", "velocity.z",
+    "motor.thrust.m1", "motor.thrust.m2", "motor.thrust.m3", "motor.thrust.m4",
+    "motor.thrust.total",
+]
+
+
 class ExtendedFlightDataLogger:
     """Logger for collecting comprehensive flight evaluation data.
     
-    Extends basic logging to include:
+    Outputs CSV columns in the same order as the WebUI CSV export
+    (SHARED_CSV_FIELDS) so that sim and real data are directly comparable.
+    
+    Includes:
     - IMU data (accelerometer, gyroscope)
     - Motor RPM per motor
     - Thrust per motor
@@ -194,13 +223,17 @@ class ExtendedFlightDataLogger:
         self.prev_time = None
         self.sim_time = 0.0
         
-    def log_step(self, env, dt: float = 0.01, target: Optional[Tuple[float, float, float]] = None, env_idx: int = 0):
+    def log_step(self, env, dt: float = 0.01, target: Optional[Tuple[float, float, float]] = None,
+                  target_yaw: float = 0.0, env_idx: int = 0):
         """Log data for a single environment (like real drone flight).
+        
+        Output columns match SHARED_CSV_FIELDS so sim/real CSVs are directly comparable.
         
         Args:
             env: The environment instance
             dt: Simulation timestep in seconds
             target: Optional target position (x, y, z) to log
+            target_yaw: Target yaw in degrees (default: 0)
             env_idx: Index of environment to log (default: 0)
         """
         self.sim_time += dt
@@ -230,45 +263,63 @@ class ExtendedFlightDataLogger:
         thrust_per_motor = L2FConstants.THRUST_COEFFICIENT * rpm ** 2  # [4]
         total_thrust = thrust_per_motor.sum()
         
-        # Store single-env data (matches real drone format)
+        # Acceleration with gravity offset (IMU-like)
+        acc_x = float(acc[0])
+        acc_y = float(acc[1])
+        acc_z = float(acc[2] + L2FConstants.GRAVITY)
+        
+        # Gyro in deg/s
+        gyro_x = float(ang_vel[0] * 180.0 / np.pi)
+        gyro_y = float(ang_vel[1] * 180.0 / np.pi)
+        gyro_z = float(ang_vel[2] * 180.0 / np.pi)
+        
+        # Build entry with SHARED_CSV_FIELDS column order
         entry = {
+            # --- Base required (flight_logger / WebUI order) ---
             "t": current_time,
-            # Position
             "stateEstimate.x": float(pos[0]),
             "stateEstimate.y": float(pos[1]),
             "stateEstimate.z": float(pos[2]),
-            # Velocity
-            "velocity.x": float(vel[0]),
-            "velocity.y": float(vel[1]),
-            "velocity.z": float(vel[2]),
-            # Accelerometer - body frame approximation (add gravity for IMU-like reading)
-            "acc.x": float(acc[0]),
-            "acc.y": float(acc[1]),
-            "acc.z": float(acc[2] + L2FConstants.GRAVITY),
-            # Gyroscope - convert rad/s to deg/s
-            "gyro.x": float(ang_vel[0] * 180.0 / np.pi),
-            "gyro.y": float(ang_vel[1] * 180.0 / np.pi),
-            "gyro.z": float(ang_vel[2] * 180.0 / np.pi),
-            # Attitude
+            "acc.x": acc_x,
+            "acc.y": acc_y,
+            "acc.z": acc_z,
+            "gyro.x": gyro_x,
+            "gyro.y": gyro_y,
+            "gyro.z": gyro_z,
             "stabilizer.roll": float(euler[0]),
             "stabilizer.pitch": float(euler[1]),
             "stabilizer.yaw": float(euler[2]),
-            # Motor values - matches real drone format
+            # --- Target ---
+            "target.x": target[0] if target else float('nan'),
+            "target.y": target[1] if target else float('nan'),
+            "target.z": target[2] if target else float('nan'),
+            "target.yaw": target_yaw,
+            # --- Battery (simulated nominal 4.2 V) ---
+            "pm.vbat": 4.2,
+            # --- Motors ---
             "motor.m1": float(rpm[0]),
             "motor.m2": float(rpm[1]),
             "motor.m3": float(rpm[2]),
             "motor.m4": float(rpm[3]),
-            # Thrust per motor (in Newtons)
+            # --- Raw IMU (sim has no separate raw; mirror filtered) ---
+            "imu.acc_x": acc_x,
+            "imu.acc_y": acc_y,
+            "imu.acc_z": acc_z,
+            "imu.gyro_x": gyro_x,
+            "imu.gyro_y": gyro_y,
+            "imu.gyro_z": gyro_z,
+            "imu.mag_x": float('nan'),  # no magnetometer in sim
+            "imu.mag_y": float('nan'),
+            "imu.mag_z": float('nan'),
+            # --- Sim-only extras ---
+            "velocity.x": float(vel[0]),
+            "velocity.y": float(vel[1]),
+            "velocity.z": float(vel[2]),
             "motor.thrust.m1": float(thrust_per_motor[0]),
             "motor.thrust.m2": float(thrust_per_motor[1]),
             "motor.thrust.m3": float(thrust_per_motor[2]),
             "motor.thrust.m4": float(thrust_per_motor[3]),
-            # Total thrust
             "motor.thrust.total": float(total_thrust),
-            # Target position (matches real drone format)
-            "target.x": target[0] if target else float('nan'),
-            "target.y": target[1] if target else float('nan'),
-            "target.z": target[2] if target else float('nan'),
         }
         
         self.log_data.append(entry)
@@ -289,11 +340,12 @@ class ExtendedFlightDataLogger:
         if not self.log_data:
             print("Warning: No flight data to save.")
             return None
-            
-        fieldnames = list(self.log_data[0].keys())
+        
+        # Use SHARED_CSV_FIELDS order so sim/real CSVs are directly comparable
+        fieldnames = SHARED_CSV_FIELDS
         
         with open(filename, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
             w.writeheader()
             w.writerows(self.log_data)
             

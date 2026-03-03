@@ -82,6 +82,11 @@ class Telemetry:
     y: Optional[float] = None
     z: Optional[float] = None
 
+    # Velocity
+    vx: Optional[float] = None
+    vy: Optional[float] = None
+    vz: Optional[float] = None
+
     # Attitude
     roll: Optional[float] = None
     pitch: Optional[float] = None
@@ -295,6 +300,11 @@ def _canonical_raw(latest: Dict[str, float]) -> Dict[str, Optional[float]]:
     for canon, cands in (imu_acc + imu_gyro + imu_mag):
         raw[canon] = _get_first_present(latest, cands)
 
+    # --- Velocity (stateEstimate.vx/vy/vz if available) ---
+    raw["velocity.x"] = _get_first_present(latest, ["stateEstimate.vx"])
+    raw["velocity.y"] = _get_first_present(latest, ["stateEstimate.vy"])
+    raw["velocity.z"] = _get_first_present(latest, ["stateEstimate.vz"])
+
     return raw
 
 
@@ -328,6 +338,9 @@ async def ws_telemetry() -> None:
                 "wx": a.wx,
                 "wy": a.wy,
                 "wz": a.wz,
+                "vx": a.vx,
+                "vy": a.vy,
+                "vz": a.vz,
             },
             # IMPORTANT: UI CSV logger prefers msg.raw with canonical CF names
             "raw": raw,
@@ -494,6 +507,14 @@ def _setup_logging(cf: Crazyflie) -> None:
             if "pm.vbat" in data:
                 STATE.telemetry.battery = float(data["pm.vbat"])
 
+            # Velocity (optional - depends on firmware TOC)
+            if "stateEstimate.vx" in data:
+                STATE.telemetry.vx = float(data["stateEstimate.vx"])
+            if "stateEstimate.vy" in data:
+                STATE.telemetry.vy = float(data["stateEstimate.vy"])
+            if "stateEstimate.vz" in data:
+                STATE.telemetry.vz = float(data["stateEstimate.vz"])
+
             STATE.telemetry.last_update_s = now_s()
         except Exception:
             pass
@@ -569,6 +590,13 @@ def _setup_logging(cf: Crazyflie) -> None:
         lc.data_received_cb.add_callback(_log_cb)
         if _try_start_logcfg(cf, lc, f"logging: imu ({label})"):
             break
+
+    # --- Optional: velocity (stateEstimate.vx/vy/vz) ---
+    lc_vel = LogConfig(name="velocity", period_in_ms=LOG_PERIOD_MS)
+    for v in ["stateEstimate.vx", "stateEstimate.vy", "stateEstimate.vz"]:
+        lc_vel.add_variable(v, "float")
+    lc_vel.data_received_cb.add_callback(_log_cb)
+    _try_start_logcfg(cf, lc_vel, "logging: velocity (stateEstimate.vx/vy/vz)")
 
 
 def _connect_blocking(uri: str) -> None:

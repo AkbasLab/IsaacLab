@@ -698,7 +698,12 @@
     "motor.m1","motor.m2","motor.m3","motor.m4",
     "imu.acc_x","imu.acc_y","imu.acc_z",
     "imu.gyro_x","imu.gyro_y","imu.gyro_z",
-    "imu.mag_x","imu.mag_y","imu.mag_z"
+    "imu.mag_x","imu.mag_y","imu.mag_z",
+
+    // --- Sim-compatible extras (real will be NaN if unavailable) ---
+    "velocity.x","velocity.y","velocity.z",
+    "motor.thrust.m1","motor.thrust.m2","motor.thrust.m3","motor.thrust.m4",
+    "motor.thrust.total"
   ];
 
   function csvEscape(v){
@@ -789,7 +794,17 @@
 
       "imu.mag_x": raw["imu.mag_x"],
       "imu.mag_y": raw["imu.mag_y"],
-      "imu.mag_z": raw["imu.mag_z"]
+      "imu.mag_z": raw["imu.mag_z"],
+
+      // --- Sim-compatible extras (NaN on real unless vel logging works) ---
+      "velocity.x": raw["velocity.x"],
+      "velocity.y": raw["velocity.y"],
+      "velocity.z": raw["velocity.z"],
+      "motor.thrust.m1": null,  // not available from real drone
+      "motor.thrust.m2": null,
+      "motor.thrust.m3": null,
+      "motor.thrust.m4": null,
+      "motor.thrust.total": null
     };
 
     const line = FLIGHT_LOG_FIELDS.map(k => csvEscape(numOrNan(row[k]))).join(",");
