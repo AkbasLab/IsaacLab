@@ -3,7 +3,7 @@
 Crazyflie Simulation Evaluation Script
 
 Evaluates trained RL policies in Isaac Lab simulation and outputs IMU values,
-motor RPM and thrust data for real-world comparison. Runs 100 parallel agents
+motor RPM/PWM and thrust data for real-world comparison. Runs 100 parallel agents
 and computes averaged statistics across all environments.
 
 Supports two modes:
@@ -12,7 +12,7 @@ Supports two modes:
 
 Output includes:
   - IMU data (accelerometer, gyroscope) from simulation
-  - Motor RPM and thrust per motor
+  - Motor PWM (matching Crazyflie firmware) and thrust per motor
   - Position, velocity, and attitude data
   - Averaged statistics across all 100 agents
   - Plots generated using flight_eval_utils.py
@@ -84,6 +84,11 @@ def parse_args():
                         help="[PointNav] Fixed goal Z height in meters (default: same as spawn)")
     parser.add_argument("--hold_time", type=float, default=5.0,
                         help="Time to hold at target after reaching it (default: 5.0s)")
+    
+    # Realistic mode
+    parser.add_argument("--realistic", action="store_true",
+                        help="Realistic ground-start: spawns at z=0 with zero velocity, angle, and motors off. "
+                             "Matches real-world test conditions (takeoff → climb → hover).")
     
     # Output options
     parser.add_argument("--output_dir", type=str, default=None,
@@ -196,9 +201,9 @@ class ExtendedFlightDataLogger:
     (SHARED_CSV_FIELDS) so that sim and real data are directly comparable.
     
     Includes:
-    - IMU data (accelerometer, gyroscope)
-    - Motor RPM per motor
-    - Thrust per motor
+    - IMU data (accelerometer in g, gyroscope in deg/s)
+    - Motor PWM per motor (0-65535, matching Crazyflie firmware)
+    - Thrust per motor (Newtons, sim-only)
     - Averaged statistics across multiple environments
     """
     
@@ -263,12 +268,18 @@ class ExtendedFlightDataLogger:
         thrust_per_motor = L2FConstants.THRUST_COEFFICIENT * rpm ** 2  # [4]
         total_thrust = thrust_per_motor.sum()
         
-        # Acceleration with gravity offset (IMU-like)
-        acc_x = float(acc[0])
-        acc_y = float(acc[1])
-        acc_z = float(acc[2] + L2FConstants.GRAVITY)
+        # Convert RPM to approximate PWM (0-65535) to match Crazyflie firmware
+        # Real drone motor.m1..m4 report PWM duty-cycle, not RPM.
+        pwm = np.clip(rpm / L2FConstants.RPM_MAX * 65535.0, 0, 65535)
         
-        # Gyro in deg/s
+        # Acceleration in g's (matching Crazyflie firmware acc.x/y/z)
+        # Firmware reports in gravitational units: ~0 at rest for x/y, ~1.0 for z.
+        G = L2FConstants.GRAVITY
+        acc_x = float(acc[0] / G)
+        acc_y = float(acc[1] / G)
+        acc_z = float((acc[2] + G) / G)  # +1g gravity offset → ~1.0 at rest
+        
+        # Gyro in deg/s (matches Crazyflie firmware gyro.x/y/z)
         gyro_x = float(ang_vel[0] * 180.0 / np.pi)
         gyro_y = float(ang_vel[1] * 180.0 / np.pi)
         gyro_z = float(ang_vel[2] * 180.0 / np.pi)
@@ -296,11 +307,11 @@ class ExtendedFlightDataLogger:
             "target.yaw": target_yaw,
             # --- Battery (simulated nominal 4.2 V) ---
             "pm.vbat": 4.2,
-            # --- Motors ---
-            "motor.m1": float(rpm[0]),
-            "motor.m2": float(rpm[1]),
-            "motor.m3": float(rpm[2]),
-            "motor.m4": float(rpm[3]),
+            # --- Motors (PWM 0-65535, matching Crazyflie firmware) ---
+            "motor.m1": float(pwm[0]),
+            "motor.m2": float(pwm[1]),
+            "motor.m3": float(pwm[2]),
+            "motor.m4": float(pwm[3]),
             # --- Raw IMU (sim has no separate raw; mirror filtered) ---
             "imu.acc_x": acc_x,
             "imu.acc_y": acc_y,
@@ -373,10 +384,10 @@ class ExtendedFlightDataLogger:
         gyro_x = get_col("gyro.x")
         gyro_y = get_col("gyro.y")
         gyro_z = get_col("gyro.z")
-        rpm_m1 = get_col("motor.m1")
-        rpm_m2 = get_col("motor.m2")
-        rpm_m3 = get_col("motor.m3")
-        rpm_m4 = get_col("motor.m4")
+        pwm_m1 = get_col("motor.m1")
+        pwm_m2 = get_col("motor.m2")
+        pwm_m3 = get_col("motor.m3")
+        pwm_m4 = get_col("motor.m4")
         thrust_total = get_col("motor.thrust.total")
         
         stats = {
@@ -395,10 +406,10 @@ class ExtendedFlightDataLogger:
             "avg_gyro_y": float(np.mean(gyro_y)),
             "avg_gyro_z": float(np.mean(gyro_z)),
             "max_gyro": float(max(np.max(np.abs(gyro_x)), np.max(np.abs(gyro_y)), np.max(np.abs(gyro_z)))),
-            # Motor stats
-            "avg_rpm": float(np.mean((rpm_m1 + rpm_m2 + rpm_m3 + rpm_m4) / 4)),
+            # Motor stats (PWM 0-65535)
+            "avg_pwm": float(np.mean((pwm_m1 + pwm_m2 + pwm_m3 + pwm_m4) / 4)),
             "avg_total_thrust": float(np.mean(thrust_total)),
-            "rpm_std": float(np.std(np.stack([rpm_m1, rpm_m2, rpm_m3, rpm_m4]))),
+            "pwm_std": float(np.std(np.stack([pwm_m1, pwm_m2, pwm_m3, pwm_m4]))),
         }
         
         return stats
@@ -408,14 +419,92 @@ class ExtendedFlightDataLogger:
 # Hover Mode
 # ==============================================================================
 
+def _apply_realistic_ground_start(env, num_envs: int, dt: float):
+    """Override environment state to realistic ground-start conditions.
+    
+    Places the drone on the ground (z ≈ 0.03m body center) with:
+    - Zero linear and angular velocity
+    - Level orientation (identity quaternion)
+    - Motors off (RPM = 0, action = -1)
+    
+    This matches how a real Crazyflie starts: sitting on a pad, motors idle,
+    waiting for the policy to command takeoff.
+    
+    Args:
+        env: The CrazyfliePointNavEnv instance (already reset)
+        num_envs: Number of environments
+        dt: Simulation timestep
+    """
+    device = env.device
+    
+    # Position: on the ground, body center ~30mm above surface
+    ground_pos = env._terrain.env_origins.clone()
+    ground_pos[:, 2] += 0.03  # Crazyflie body center height on ground
+    
+    # Level orientation (identity quaternion: w=1, x=y=z=0)
+    identity_quat = torch.zeros(num_envs, 4, device=device)
+    identity_quat[:, 0] = 1.0
+    
+    root_pose = torch.cat([ground_pos, identity_quat], dim=-1)
+    root_vel = torch.zeros(num_envs, 6, device=device)  # zero lin + ang vel
+    
+    all_ids = torch.arange(num_envs, device=device)
+    env._robot.write_root_pose_to_sim(root_pose, all_ids)
+    env._robot.write_root_velocity_to_sim(root_vel, all_ids)
+    
+    # Motors off
+    env._rpm_state[:] = 0.0
+    env._action_history[:] = -1.0   # action -1 → 0 RPM
+    env._actions[:] = -1.0
+    
+    # Commit the state to the physics engine
+    env.scene.write_data_to_sim()
+    env.sim.step()
+    env.scene.update(dt)
+
+
+def _configure_realistic_cfg(cfg, target_z: float):
+    """Adjust environment config for realistic ground-start evaluation.
+    
+    Relaxes termination bounds so the drone isn't killed for being at ground
+    level during takeoff, and disables spawn randomization.
+    
+    Args:
+        cfg: CrazyfliePointNavEnvCfg to modify in-place
+        target_z: Target hover height in meters
+    """
+    # Relax termination bounds to allow ground-level operation
+    cfg.term_z_hard_min = -0.5   # Well below ground — never triggers
+    cfg.term_z_soft_min = -0.1   # Below ground
+    # Keep upper bounds generous
+    cfg.term_z_soft_max = max(target_z + 2.0, 2.50)
+    cfg.term_z_hard_max = max(target_z + 3.0, 3.00)
+    
+    # init_target_height must satisfy: soft_min < init_target_height < soft_max
+    cfg.init_target_height = target_z
+    
+    # Disable spawn randomization (we override anyway, but be safe)
+    cfg.init_guidance_probability = 1.0  # 100% "guided" = zero perturbation
+    cfg.init_max_xy_offset = 0.0
+    cfg.init_max_angle = 0.0
+    cfg.init_max_linear_velocity = 0.0
+    cfg.init_max_angular_velocity = 0.0
+    cfg.init_height_offset_min = 0.0
+    cfg.init_height_offset_max = 0.0
+
+
 def run_hover_eval(checkpoint_path: str, num_envs: int, duration: float, 
                    output_dir: str, no_plot: bool, target_z: float = 1.0,
-                   hold_time: float = 5.0):
+                   hold_time: float = 5.0, realistic: bool = False):
     """Run hover evaluation with specified checkpoint.
     
     Uses the same PointNav environment as training, with a fixed goal at (0, 0, target_z)
     to evaluate hovering stability. The drone will fly to the target height and hover
     there for hold_time seconds after reaching it.
+    
+    When realistic=True, the drone starts on the ground (z≈0) with motors off,
+    matching real-world test conditions where the drone must take off, climb,
+    and hover entirely under policy control.
     
     Args:
         checkpoint_path: Path to trained model checkpoint
@@ -425,6 +514,7 @@ def run_hover_eval(checkpoint_path: str, num_envs: int, duration: float,
         no_plot: If True, skip plot generation
         target_z: Target hover height in meters
         hold_time: Time to hold at target after reaching it (default: 5.0s)
+        realistic: If True, start from ground with zero velocity/angle/motors
     """
     
     # Use same environment as training (pointnav) for checkpoint compatibility
@@ -435,17 +525,25 @@ def run_hover_eval(checkpoint_path: str, num_envs: int, duration: float,
     cfg.scene.num_envs = num_envs
     cfg.episode_length_s = duration + 1.0  # Ensure episode is long enough
     
+    if realistic:
+        _configure_realistic_cfg(cfg, target_z)
+    
     # Fixed goal at (0, 0, target_z) for hover mode
     fixed_goal = (0.0, 0.0, target_z)
     
+    mode_label = "REALISTIC HOVER" if realistic else "HOVER"
     print(f"\n{'='*60}")
-    print(f"HOVER EVALUATION (using PointNav environment)")
+    print(f"{mode_label} EVALUATION (using PointNav environment)")
     print(f"{'='*60}")
     print(f"  Checkpoint: {checkpoint_path}")
     print(f"  Environments: {num_envs}")
     print(f"  Duration: {duration}s")
     print(f"  Target Position: ({fixed_goal[0]:.2f}, {fixed_goal[1]:.2f}, {fixed_goal[2]:.2f})m")
     print(f"  Hold Time: {hold_time}s after reaching target")
+    if realistic:
+        print(f"  Start: GROUND (z≈0.03m, motors off, zero velocity)")
+    else:
+        print(f"  Start: Mid-air (training default)")
     print(f"  Output: {output_dir}")
     print(f"{'='*60}\n")
     
@@ -485,6 +583,15 @@ def run_hover_eval(checkpoint_path: str, num_envs: int, duration: float,
     env._goal_pos[:, 1] = fixed_goal[1]
     env._goal_pos[:, 2] = fixed_goal[2]
     print(f"  Fixed goal set to: ({fixed_goal[0]:.2f}, {fixed_goal[1]:.2f}, {fixed_goal[2]:.2f})m")
+    
+    # Apply realistic ground-start override (after reset + goal set)
+    if realistic:
+        dt = cfg.sim.dt
+        _apply_realistic_ground_start(env, num_envs, dt)
+        # Re-acquire observations from the new ground-level state
+        obs_dict = env._get_observations()
+        obs = obs_dict["policy"]
+        print(f"  Ground-start applied: z={env._robot.data.root_pos_w[0, 2].item():.3f}m, motors=OFF")
     
     # Compute number of steps
     dt = cfg.sim.dt
@@ -586,7 +693,7 @@ def run_hover_eval(checkpoint_path: str, num_envs: int, duration: float,
     print(f"  Max roll: {stats.get('max_roll', 0):.2f} deg")
     print(f"  Max pitch: {stats.get('max_pitch', 0):.2f} deg")
     print(f"  Max gyro: {stats.get('max_gyro', 0):.2f} deg/s")
-    print(f"  Avg motor RPM: {stats.get('avg_rpm', 0):.0f}")
+    print(f"  Avg motor PWM: {stats.get('avg_pwm', 0):.0f}")
     print(f"  Avg total thrust: {stats.get('avg_total_thrust', 0)*1000:.2f}mN")
     print(f"{'='*40}\n")
     
@@ -594,7 +701,8 @@ def run_hover_eval(checkpoint_path: str, num_envs: int, duration: float,
     if not no_plot:
         plot_flight_data(csv_path, title_prefix="Hover Evaluation", output_dir=output_dir)
         plot_motor_data(csv_path, title_prefix="Hover Evaluation", output_dir=output_dir,
-                       hover_rpm=L2FConstants.hover_rpm(), mass=L2FConstants.MASS, gravity=L2FConstants.GRAVITY)
+                       hover_rpm=L2FConstants.hover_rpm(), mass=L2FConstants.MASS, gravity=L2FConstants.GRAVITY,
+                       rpm_max=L2FConstants.RPM_MAX)
     
     # Cleanup
     env.close()
@@ -611,11 +719,14 @@ def run_pointnav_eval(checkpoint_path: str, num_envs: int, duration: float,
                       target_x: Optional[float] = None,
                       target_y: Optional[float] = None,
                       goal_z: Optional[float] = None,
-                      hold_time: float = 5.0):
+                      hold_time: float = 5.0,
+                      realistic: bool = False):
     """Run point navigation evaluation with specified checkpoint.
     
     The drone will navigate to the goal and hover there for hold_time seconds
     after reaching it to demonstrate stability.
+    
+    When realistic=True, the drone starts on the ground (z≈0) with motors off.
     
     Args:
         checkpoint_path: Path to trained model checkpoint
@@ -627,6 +738,7 @@ def run_pointnav_eval(checkpoint_path: str, num_envs: int, duration: float,
         target_y: Fixed goal Y position in meters (None for random)
         goal_z: Fixed goal Z height in meters (None for default)
         hold_time: Time to hold at goal after reaching it (default: 5.0s)
+        realistic: If True, start from ground with zero velocity/angle/motors
     """
     
     # Import pointnav environment
@@ -636,6 +748,10 @@ def run_pointnav_eval(checkpoint_path: str, num_envs: int, duration: float,
     cfg = CrazyfliePointNavEnvCfg()
     cfg.scene.num_envs = num_envs
     cfg.episode_length_s = duration + 1.0
+    
+    if realistic:
+        target_height = goal_z if goal_z is not None else cfg.goal_height
+        _configure_realistic_cfg(cfg, target_height)
     
     # Use fixed goal if specified
     use_fixed_goal = target_x is not None and target_y is not None
@@ -655,6 +771,8 @@ def run_pointnav_eval(checkpoint_path: str, num_envs: int, duration: float,
     else:
         print(f"  Goal Mode: Random (within {cfg.goal_max_distance}m)")
     print(f"  Hold Time: {hold_time}s after reaching goal")
+    if realistic:
+        print(f"  Start: GROUND (z≈0.03m, motors off, zero velocity)")
     print(f"  Output: {output_dir}")
     print(f"{'='*60}\n")
     
@@ -703,6 +821,14 @@ def run_pointnav_eval(checkpoint_path: str, num_envs: int, duration: float,
                              (drone_pos[:, 1] - env._goal_pos[:, 1])**2)
         env._prev_dist_xy = dist_xy
         print(f"  Fixed goal set to: ({fixed_goal_pos[0]:.2f}, {fixed_goal_pos[1]:.2f}, {fixed_goal_pos[2]:.2f})m")
+    
+    # Apply realistic ground-start override
+    if realistic:
+        dt_val = cfg.sim.dt
+        _apply_realistic_ground_start(env, num_envs, dt_val)
+        obs_dict = env._get_observations()
+        obs = obs_dict["policy"]
+        print(f"  Ground-start applied: z={env._robot.data.root_pos_w[0, 2].item():.3f}m, motors=OFF")
     
     # Compute number of steps
     dt = cfg.sim.dt
@@ -807,7 +933,7 @@ def run_pointnav_eval(checkpoint_path: str, num_envs: int, duration: float,
     print(f"  Max roll: {stats.get('max_roll', 0):.2f} deg")
     print(f"  Max pitch: {stats.get('max_pitch', 0):.2f} deg")
     print(f"  Max gyro: {stats.get('max_gyro', 0):.2f} deg/s")
-    print(f"  Avg motor RPM: {stats.get('avg_rpm', 0):.0f}")
+    print(f"  Avg motor PWM: {stats.get('avg_pwm', 0):.0f}")
     print(f"  Avg total thrust: {stats.get('avg_total_thrust', 0)*1000:.2f}mN")
     print(f"{'='*40}\n")
     
@@ -815,7 +941,8 @@ def run_pointnav_eval(checkpoint_path: str, num_envs: int, duration: float,
     if not no_plot:
         plot_flight_data(csv_path, title_prefix="Point Navigation Evaluation", output_dir=output_dir)
         plot_motor_data(csv_path, title_prefix="Point Navigation Evaluation", output_dir=output_dir,
-                       hover_rpm=L2FConstants.hover_rpm(), mass=L2FConstants.MASS, gravity=L2FConstants.GRAVITY)
+                       hover_rpm=L2FConstants.hover_rpm(), mass=L2FConstants.MASS, gravity=L2FConstants.GRAVITY,
+                       rpm_max=L2FConstants.RPM_MAX)
     
     # Cleanup
     env.close()
@@ -857,7 +984,8 @@ def main():
             output_dir=output_dir,
             no_plot=args.no_plot,
             target_z=args.target_z,
-            hold_time=args.hold_time
+            hold_time=args.hold_time,
+            realistic=args.realistic
         )
     else:  # pointnav
         stats = run_pointnav_eval(
@@ -869,7 +997,8 @@ def main():
             target_x=args.target_x,
             target_y=args.target_y,
             goal_z=args.goal_z,
-            hold_time=args.hold_time
+            hold_time=args.hold_time,
+            realistic=args.realistic
         )
     
     print(f"\nEvaluation complete!")

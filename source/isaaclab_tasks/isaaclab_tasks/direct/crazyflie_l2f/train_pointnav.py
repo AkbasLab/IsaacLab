@@ -80,9 +80,10 @@ def parse_args():
 def _is_isaac_sim_running():
     """Check if Isaac Sim/Omniverse is already initialized."""
     try:
-        import carb
-        return carb.get_framework() is not None
-    except (ImportError, AttributeError):
+        import omni.kit.app
+        app = omni.kit.app.get_app()
+        return app is not None and app.is_running()
+    except (ImportError, AttributeError, Exception):
         return False
 
 # Only initialize AppLauncher if Isaac Sim isn't already running

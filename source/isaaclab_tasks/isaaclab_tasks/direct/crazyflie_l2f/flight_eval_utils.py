@@ -124,7 +124,7 @@ def plot_flight_data(filename: str, title_prefix: str = "Flight", output_dir: Op
     plt.plot(t, df["acc.z"], label="az")
     plt.title(f"{title_prefix} - Accelerometer Data")
     plt.xlabel("Time [s]")
-    plt.ylabel("Acceleration [m/s²]")
+    plt.ylabel("Acceleration [g]")
     plt.legend()
     plt.grid(True)
     if output_dir:
@@ -176,7 +176,7 @@ def plot_flight_data(filename: str, title_prefix: str = "Flight", output_dir: Op
     ax3.plot(t, df["acc.z"], label="az")
     ax3.set_title(f"{title_prefix} - Accelerometer")
     ax3.set_xlabel("Time [s]")
-    ax3.set_ylabel("Acceleration [m/s²]")
+    ax3.set_ylabel("Acceleration [g]")
     ax3.legend()
     ax3.grid(True)
     
@@ -313,16 +313,21 @@ class FlightDataLogger:
 
 
 def plot_motor_data(filename: str, title_prefix: str = "Flight", output_dir: Optional[str] = None,
-                    hover_rpm: float = 7249.0, mass: float = 0.027, gravity: float = 9.81):
-    """Plot motor RPM and thrust data from CSV file.
+                    hover_rpm: float = 7249.0, mass: float = 0.027, gravity: float = 9.81,
+                    rpm_max: float = 21702.0):
+    """Plot motor PWM and thrust data from CSV file.
+    
+    Motor columns (motor.m1..m4) are in PWM (0-65535), matching Crazyflie
+    firmware output. A hover-PWM reference line is computed from hover_rpm.
     
     Args:
         filename: Path to CSV file containing motor data
         title_prefix: Prefix for plot titles
         output_dir: Directory to save plots. If None, plots are displayed.
-        hover_rpm: Expected hover RPM for reference line
+        hover_rpm: Expected hover RPM (used to compute hover PWM reference)
         mass: Drone mass in kg for thrust reference
         gravity: Gravitational acceleration in m/s^2
+        rpm_max: Maximum RPM (used for RPM → PWM conversion)
     """
     df = load_csv_as_dict(filename)
     t = df["t"]
@@ -342,20 +347,21 @@ def plot_motor_data(filename: str, title_prefix: str = "Flight", output_dir: Opt
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
     
-    # --- Plot Motor RPM ---
+    # --- Plot Motor PWM ---
+    hover_pwm = hover_rpm / rpm_max * 65535.0
     plt.figure(figsize=(12, 6))
     plt.plot(t, df[motor_cols[0]], label="M1 (FR)", linewidth=1)
     plt.plot(t, df[motor_cols[1]], label="M2 (BR)", linewidth=1)
     plt.plot(t, df[motor_cols[2]], label="M3 (BL)", linewidth=1)
     plt.plot(t, df[motor_cols[3]], label="M4 (FL)", linewidth=1)
-    plt.axhline(y=hover_rpm, color='r', linestyle='--', label=f'Hover RPM ({hover_rpm:.0f})', alpha=0.5)
-    plt.title(f"{title_prefix} - Motor RPM")
+    plt.axhline(y=hover_pwm, color='r', linestyle='--', label=f'Hover PWM ({hover_pwm:.0f})', alpha=0.5)
+    plt.title(f"{title_prefix} - Motor PWM")
     plt.xlabel("Time [s]")
-    plt.ylabel("RPM")
+    plt.ylabel("PWM (0–65535)")
     plt.legend()
     plt.grid(True, alpha=0.3)
     if output_dir:
-        plt.savefig(os.path.join(output_dir, f"{title_prefix.lower().replace(' ', '_')}_motor_rpm.jpg"), 
+        plt.savefig(os.path.join(output_dir, f"{title_prefix.lower().replace(' ', '_')}_motor_pwm.jpg"), 
                     dpi=150, bbox_inches='tight')
         plt.close()
     

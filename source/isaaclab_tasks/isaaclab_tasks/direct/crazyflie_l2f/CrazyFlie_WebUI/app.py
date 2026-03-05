@@ -33,10 +33,12 @@ Files:
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import threading
 import time
+import zipfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -45,8 +47,8 @@ import cflib.crtp
 from cflib.crazyflie import Crazyflie
 from cflib.crazyflie.log import LogConfig
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi.responses import HTMLResponse, Response
 
 # ----------------------------
 # Config
@@ -171,6 +173,27 @@ class ControlState:
 
     # Human-readable notes about optional logs that actually started
     log_notes: List[str] = field(default_factory=list)
+
+
+def _clear_telemetry_state() -> None:
+    STATE.telemetry = Telemetry()
+    STATE.target = Target()
+    with STATE.latest_lock:
+        STATE.latest_log.clear()
+    STATE.log_notes = []
+
+
+def _mark_link_down(reason: str = "") -> None:
+    STATE.connected = False
+    STATE.cf = None
+    STATE.mode = "idle"
+    STATE.phase = "idle"
+    STATE.plan_active = False
+    STATE.deadman_enabled = False
+    STATE.plan_started_at = 0.0
+    STATE.plan_hold_until = 0.0
+    STATE.plan_hold_target = None
+    _clear_telemetry_state()
 
 
 STATE = ControlState()
@@ -615,10 +638,18 @@ def _connect_blocking(uri: str) -> None:
 
     def _on_lost(_uri, msg):
         err["msg"] = f"link lost: {msg}"
+        _mark_link_down(err["msg"])
+
+    def _on_disconnected(_uri):
+        _mark_link_down("disconnected")
 
     cf.connected.add_callback(_on_connected)
     cf.connection_failed.add_callback(_on_failed)
     cf.connection_lost.add_callback(_on_lost)
+    try:
+        cf.disconnected.add_callback(_on_disconnected)
+    except Exception:
+        pass
 
     cf.open_link(uri)
 
@@ -638,9 +669,8 @@ def _connect_blocking(uri: str) -> None:
 
     _safe_send_stop(cf)
 
-    # Clear previous raw state
-    with STATE.latest_lock:
-        STATE.latest_log.clear()
+    # Clear previous runtime state
+    _clear_telemetry_state()
 
     _setup_logging(cf)
 
@@ -669,15 +699,7 @@ def _disconnect_blocking() -> None:
     except Exception:
         pass
 
-    STATE.cf = None
-    STATE.connected = False
-    STATE.mode = "idle"
-    STATE.phase = "idle"
-    STATE.plan_active = False
-    STATE.deadman_enabled = False
-    STATE.plan_started_at = 0.0
-    STATE.plan_hold_until = 0.0
-    STATE.plan_hold_target = None
+    _mark_link_down("manual disconnect")
 
 
 # ----------------------------
@@ -805,6 +827,118 @@ def _ensure_send_thread() -> None:
     t.start()
 
 
+def _build_plots_zip_from_csv_text(csv_text: str) -> bytes:
+    import pandas as pd
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    df = pd.read_csv(io.StringIO(csv_text))
+    if "t" not in df.columns:
+        raise ValueError("CSV is missing required time column: t")
+
+    t = df["t"]
+    buffer = io.BytesIO()
+
+    def _save_plot_to_zip(zf: zipfile.ZipFile, name: str, draw_fn) -> None:
+        plt.figure()
+        draw_fn()
+        plt.tight_layout()
+        img = io.BytesIO()
+        plt.savefig(img, format="png", dpi=200)
+        plt.close()
+        img.seek(0)
+        zf.writestr(f"{name}.png", img.read())
+
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        _save_plot_to_zip(
+            zf,
+            "position",
+            lambda: (
+                plt.plot(t, df["stateEstimate.x"], label="x (m)"),
+                plt.plot(t, df["stateEstimate.y"], label="y (m)"),
+                plt.plot(t, df["stateEstimate.z"], label="z (m)"),
+                plt.title("Drone Position over Time"),
+                plt.xlabel("Time [s]"),
+                plt.ylabel("Position [m]"),
+                plt.legend(),
+                plt.grid(True),
+            ),
+        )
+        _save_plot_to_zip(
+            zf,
+            "attitude",
+            lambda: (
+                plt.plot(t, df["stabilizer.roll"], label="Roll (°)"),
+                plt.plot(t, df["stabilizer.pitch"], label="Pitch (°)"),
+                plt.plot(t, df["stabilizer.yaw"], label="Yaw (°)"),
+                plt.title("Attitude (Orientation) over Time"),
+                plt.xlabel("Time [s]"),
+                plt.ylabel("Angle [°]"),
+                plt.legend(),
+                plt.grid(True),
+            ),
+        )
+        _save_plot_to_zip(
+            zf,
+            "acceleration",
+            lambda: (
+                plt.plot(t, df["acc.x"], label="ax"),
+                plt.plot(t, df["acc.y"], label="ay"),
+                plt.plot(t, df["acc.z"], label="az"),
+                plt.title("Accelerometer Data"),
+                plt.xlabel("Time [s]"),
+                plt.ylabel("Acceleration [g]"),
+                plt.legend(),
+                plt.grid(True),
+            ),
+        )
+        _save_plot_to_zip(
+            zf,
+            "gyro",
+            lambda: (
+                plt.plot(t, df["gyro.x"], label="wx"),
+                plt.plot(t, df["gyro.y"], label="wy"),
+                plt.plot(t, df["gyro.z"], label="wz"),
+                plt.title("Gyroscope Data"),
+                plt.xlabel("Time [s]"),
+                plt.ylabel("Angular velocity [°/s]"),
+                plt.legend(),
+                plt.grid(True),
+            ),
+        )
+
+        numeric_cols = df.select_dtypes(include="number").columns
+        skip = {
+            "t",
+            "stateEstimate.x", "stateEstimate.y", "stateEstimate.z",
+            "stabilizer.roll", "stabilizer.pitch", "stabilizer.yaw",
+            "acc.x", "acc.y", "acc.z",
+            "gyro.x", "gyro.y", "gyro.z",
+        }
+        for col in numeric_cols:
+            if col in skip:
+                continue
+            safe = col.replace(".", "_").replace("/", "_")
+            _save_plot_to_zip(
+                zf,
+                safe,
+                lambda col=col: (
+                    plt.plot(t, df[col], label=col),
+                    plt.title(f"{col} over Time"),
+                    plt.xlabel("Time [s]"),
+                    plt.ylabel(col),
+                    plt.legend(),
+                    plt.grid(True),
+                ),
+            )
+
+        zf.writestr("source.csv", csv_text.encode("utf-8"))
+
+    buffer.seek(0)
+    return buffer.read()
+
+
 # ----------------------------
 # FastAPI lifespan
 # ----------------------------
@@ -850,6 +984,23 @@ def index() -> HTMLResponse:
         return HTMLResponse(f.read())
 
 
+@app.post("/api/plots/export")
+async def export_plots(request: Request):
+    payload = await request.json()
+    csv_text = str(payload.get("csv") or "")
+    stamp = str(payload.get("stamp") or int(time.time()))
+    if not csv_text.strip():
+        return Response(content=json.dumps({"error": "Missing csv payload"}), status_code=400, media_type="application/json")
+
+    try:
+        zip_bytes = await asyncio.to_thread(_build_plots_zip_from_csv_text, csv_text)
+    except Exception as e:
+        return Response(content=json.dumps({"error": str(e)}), status_code=400, media_type="application/json")
+
+    headers = {"Content-Disposition": f'attachment; filename="flight_plots_{stamp}.zip"'}
+    return Response(content=zip_bytes, media_type="application/zip", headers=headers)
+
+
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -857,6 +1008,7 @@ async def ws_endpoint(websocket: WebSocket):
         CLIENTS.add(websocket)
 
     await ws_status("welcome")
+    await ws_telemetry()
     await ws_log("WebSocket client connected")
 
     try:

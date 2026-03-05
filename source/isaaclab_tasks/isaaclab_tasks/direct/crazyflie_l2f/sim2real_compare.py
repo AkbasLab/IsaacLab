@@ -54,19 +54,23 @@ COMPARE_SIGNALS = [
     ("stabilizer.roll",  "Roll",  "deg"),
     ("stabilizer.pitch", "Pitch", "deg"),
     ("stabilizer.yaw",   "Yaw",   "deg"),
-    # Accelerometer
-    ("acc.x", "Accel X", "m/s²"),
-    ("acc.y", "Accel Y", "m/s²"),
-    ("acc.z", "Accel Z", "m/s²"),
+    # Accelerometer (Crazyflie firmware reports in g; sim now matches)
+    ("acc.x", "Accel X", "g"),
+    ("acc.y", "Accel Y", "g"),
+    ("acc.z", "Accel Z", "g"),
     # Gyroscope
     ("gyro.x", "Gyro X", "deg/s"),
     ("gyro.y", "Gyro Y", "deg/s"),
     ("gyro.z", "Gyro Z", "deg/s"),
-    # Motors (may be NaN on real if firmware doesn't expose them)
-    ("motor.m1", "Motor M1", "RPM/PWM"),
-    ("motor.m2", "Motor M2", "RPM/PWM"),
-    ("motor.m3", "Motor M3", "RPM/PWM"),
-    ("motor.m4", "Motor M4", "RPM/PWM"),
+    # Velocity (may be NaN on real if firmware doesn't expose stateEstimate.vx/vy/vz)
+    ("velocity.x", "Velocity X", "m/s"),
+    ("velocity.y", "Velocity Y", "m/s"),
+    ("velocity.z", "Velocity Z", "m/s"),
+    # Motors (PWM 0-65535 on both sim and real)
+    ("motor.m1", "Motor M1", "PWM"),
+    ("motor.m2", "Motor M2", "PWM"),
+    ("motor.m3", "Motor M3", "PWM"),
+    ("motor.m4", "Motor M4", "PWM"),
 ]
 
 # Signals for tracking-error analysis (need target columns present)
