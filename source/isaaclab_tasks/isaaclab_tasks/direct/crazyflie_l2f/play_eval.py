@@ -85,10 +85,10 @@ def parse_args():
     parser.add_argument("--hold_time", type=float, default=5.0,
                         help="Time to hold at target after reaching it (default: 5.0s)")
     
-    # Realistic mode
+        # Realistic mode (pointnav only; hover always uses legacy mid-air start)
     parser.add_argument("--realistic", action="store_true",
-                        help="Realistic ground-start: spawns at z=0 with zero velocity, angle, and motors off. "
-                             "Matches real-world test conditions (takeoff → climb → hover).")
+                        help="Realistic ground-start for pointnav mode only. "
+                            "Hover mode always starts at hover height (legacy behavior).")
     
     # Output options
     parser.add_argument("--output_dir", type=str, default=None,
@@ -217,6 +217,7 @@ class ExtendedFlightDataLogger:
         self.log_data = []
         self.t0 = time.perf_counter()
         self.prev_vel = None
+        self.prev_pos = None
         self.prev_time = None
         self.sim_time = 0.0
         
@@ -225,11 +226,12 @@ class ExtendedFlightDataLogger:
         self.log_data = []
         self.t0 = time.perf_counter()
         self.prev_vel = None
+        self.prev_pos = None
         self.prev_time = None
         self.sim_time = 0.0
         
     def log_step(self, env, dt: float = 0.01, target: Optional[Tuple[float, float, float]] = None,
-                  target_yaw: float = 0.0, env_idx: int = 0):
+                  target_yaw: float = 0.0, env_idx: int = 0, reset_flag: bool = False):
         """Log data for a single environment (like real drone flight).
         
         Output columns match SHARED_CSV_FIELDS so sim/real CSVs are directly comparable.
@@ -240,6 +242,7 @@ class ExtendedFlightDataLogger:
             target: Optional target position (x, y, z) to log
             target_yaw: Target yaw in degrees (default: 0)
             env_idx: Index of environment to log (default: 0)
+            reset_flag: True if this env terminated/truncated on this step
         """
         self.sim_time += dt
         current_time = self.sim_time
@@ -253,8 +256,15 @@ class ExtendedFlightDataLogger:
         # Convert quaternion to euler
         euler = quat_to_euler(quat.unsqueeze(0)).squeeze(0).numpy()  # [3]
         
-        # Compute acceleration from velocity (like real IMU)
-        if self.prev_vel is not None and self.prev_time is not None:
+        # Compute acceleration from velocity (like real IMU).
+        # Guard against reset discontinuities: DirectRLEnv auto-resets done envs,
+        # which creates one-step state jumps that look like impossible spikes.
+        jump_detected = False
+        if self.prev_pos is not None:
+            # >30 cm in 10 ms is physically implausible for this platform.
+            jump_detected = np.linalg.norm(pos - self.prev_pos) > 0.30
+
+        if self.prev_vel is not None and self.prev_time is not None and not (reset_flag or jump_detected):
             delta_t = current_time - self.prev_time
             if delta_t > 0:
                 acc = (vel - self.prev_vel) / delta_t
@@ -337,6 +347,7 @@ class ExtendedFlightDataLogger:
         
         # Update previous values for next acceleration computation
         self.prev_vel = vel.copy()
+        self.prev_pos = pos.copy()
         self.prev_time = current_time
         
     def save_to_csv(self, filename: str) -> Optional[str]:
@@ -452,15 +463,53 @@ def _apply_realistic_ground_start(env, num_envs: int, dt: float):
     env._robot.write_root_pose_to_sim(root_pose, all_ids)
     env._robot.write_root_velocity_to_sim(root_vel, all_ids)
     
-    # Motors off
+    # Motors off. Firmware starts with zero-filled action history even though
+    # motors are idle, so keep those two states distinct here.
     env._rpm_state[:] = 0.0
-    env._action_history[:] = -1.0   # action -1 → 0 RPM
+    env._action_history[:] = 0.0
     env._actions[:] = -1.0
     
     # Commit the state to the physics engine
     env.scene.write_data_to_sim()
     env.sim.step()
     env.scene.update(dt)
+
+
+def _apply_firmware_aligned_policy_state(env, motors_off: bool):
+    """Align policy state with the flashed 149-dim firmware runtime.
+
+    The onboard adapter starts with:
+    - zero-filled action history
+    - most recent action buffer at zero
+    - optional motors-off RPM state prior to activation
+
+    For mid-air hover eval we keep RPM at hover to avoid an artificial drop,
+    but still zero the policy history to match firmware inputs.
+    """
+    env._action_history[:] = 0.0
+    env._actions[:] = 0.0
+    if motors_off:
+        env._rpm_state[:] = 0.0
+
+
+class _FirmwareActionSmoother:
+    """Approximate the onboard 500 Hz action smoothing at 100 Hz sim rate."""
+
+    def __init__(self, num_envs: int, action_dim: int, device: torch.device, alpha: float = 0.2):
+        self._alpha = alpha
+        self._smoothed = torch.zeros(num_envs, action_dim, device=device)
+
+    def reset(self, value: Optional[torch.Tensor] = None):
+        if value is None:
+            self._smoothed.zero_()
+        else:
+            self._smoothed.copy_(value)
+
+    def step(self, raw_action: torch.Tensor) -> torch.Tensor:
+        # Equivalent to taking the mean of the previous 4 substeps plus the
+        # newest policy output, which matches the firmware adapter's 5x update.
+        self._smoothed.mul_(1.0 - self._alpha).add_(raw_action, alpha=self._alpha)
+        return self._smoothed.clone()
 
 
 def _configure_realistic_cfg(cfg, target_z: float):
@@ -493,6 +542,56 @@ def _configure_realistic_cfg(cfg, target_z: float):
     cfg.init_height_offset_max = 0.0
 
 
+def _configure_stable_eval_cfg(cfg, target_z: float):
+    """Make evaluation deterministic and free of training-reset artifacts.
+
+    Evaluation is meant to compare sim and real trajectories for the same
+    trained controller, so we disable domain randomization and relax reset
+    conditions enough to avoid mid-log auto-resets.
+    """
+    cfg.enable_disturbance = False
+
+    # Remove spawn randomness so every rollout starts from the same condition.
+    cfg.init_target_height = target_z
+    cfg.goal_height = target_z
+    cfg.init_guidance_probability = 1.0
+    cfg.init_max_xy_offset = 0.0
+    cfg.init_max_angle = 0.0
+    cfg.init_max_linear_velocity = 0.0
+    cfg.init_max_angular_velocity = 0.0
+    cfg.init_height_offset_min = 0.0
+    cfg.init_height_offset_max = 0.0
+
+    # Disable env-driven success termination; external eval logic tracks success.
+    cfg.goal_reach_threshold = -1.0
+
+    # Relax safety bounds to prevent auto-reset discontinuities in the logs.
+    cfg.term_xy_threshold = 10.0
+    cfg.term_z_soft_min = -1.0
+    cfg.term_z_hard_min = -2.0
+    cfg.term_z_soft_max = max(target_z + 2.0, 3.0)
+    cfg.term_z_hard_max = max(target_z + 3.0, 4.0)
+    cfg.term_tilt_soft_threshold = np.pi
+    cfg.term_tilt_hard_threshold = np.pi + 0.1
+    cfg.term_linear_velocity_soft_threshold = 100.0
+    cfg.term_linear_velocity_hard_threshold = 200.0
+    cfg.term_angular_velocity_soft_threshold = 1000.0
+    cfg.term_angular_velocity_hard_threshold = 2000.0
+
+
+def _configure_firmware_actuator_cfg(cfg):
+    """Match the flashed firmware's action-to-motor interpretation.
+
+    The onboard 149-dim controller maps actor outputs directly from [-1, 1] to
+    [0, MAX_RPM]. The current training env supports a hover-centered action
+    parameterization, but that is not what the flashed runtime uses.
+    """
+    if hasattr(cfg, "use_hover_centered_actions"):
+        cfg.use_hover_centered_actions = False
+    if hasattr(cfg, "action_scale"):
+        cfg.action_scale = 1.0
+
+
 def run_hover_eval(checkpoint_path: str, num_envs: int, duration: float, 
                    output_dir: str, no_plot: bool, target_z: float = 1.0,
                    hold_time: float = 5.0, realistic: bool = False):
@@ -502,9 +601,8 @@ def run_hover_eval(checkpoint_path: str, num_envs: int, duration: float,
     to evaluate hovering stability. The drone will fly to the target height and hover
     there for hold_time seconds after reaching it.
     
-    When realistic=True, the drone starts on the ground (z≈0) with motors off,
-    matching real-world test conditions where the drone must take off, climb,
-    and hover entirely under policy control.
+    Hover mode always uses legacy mid-air initialization at target height
+    (no ground-start override).
     
     Args:
         checkpoint_path: Path to trained model checkpoint
@@ -514,7 +612,7 @@ def run_hover_eval(checkpoint_path: str, num_envs: int, duration: float,
         no_plot: If True, skip plot generation
         target_z: Target hover height in meters
         hold_time: Time to hold at target after reaching it (default: 5.0s)
-        realistic: If True, start from ground with zero velocity/angle/motors
+        realistic: Deprecated for hover mode; ignored
     """
     
     # Use same environment as training (pointnav) for checkpoint compatibility
@@ -524,14 +622,21 @@ def run_hover_eval(checkpoint_path: str, num_envs: int, duration: float,
     cfg = CrazyfliePointNavEnvCfg()
     cfg.scene.num_envs = num_envs
     cfg.episode_length_s = duration + 1.0  # Ensure episode is long enough
+    cfg.debug_vis = False  # Keep eval logs cleaner in headless runs
+
+    # Hover eval should start at the commanded hover height (not training default
+    # 1.0 m) so sim and real hover datasets are directly comparable.
+    _configure_stable_eval_cfg(cfg, target_z)
+    _configure_firmware_actuator_cfg(cfg)
     
-    if realistic:
-        _configure_realistic_cfg(cfg, target_z)
+    # Keep legacy hover behavior: spawn at target height with no realistic
+    # ground-start override in hover mode.
     
-    # Fixed goal at (0, 0, target_z) for hover mode
+    # Per-env fixed hover goal in each env's local frame (origin + [0, 0, target_z]).
+    # This prevents unintended lateral travel toward world (0, 0, z).
     fixed_goal = (0.0, 0.0, target_z)
     
-    mode_label = "REALISTIC HOVER" if realistic else "HOVER"
+    mode_label = "HOVER"
     print(f"\n{'='*60}")
     print(f"{mode_label} EVALUATION (using PointNav environment)")
     print(f"{'='*60}")
@@ -540,10 +645,7 @@ def run_hover_eval(checkpoint_path: str, num_envs: int, duration: float,
     print(f"  Duration: {duration}s")
     print(f"  Target Position: ({fixed_goal[0]:.2f}, {fixed_goal[1]:.2f}, {fixed_goal[2]:.2f})m")
     print(f"  Hold Time: {hold_time}s after reaching target")
-    if realistic:
-        print(f"  Start: GROUND (z≈0.03m, motors off, zero velocity)")
-    else:
-        print(f"  Start: Mid-air (training default)")
+    print(f"  Start: Mid-air (training default)")
     print(f"  Output: {output_dir}")
     print(f"{'='*60}\n")
     
@@ -560,12 +662,16 @@ def run_hover_eval(checkpoint_path: str, num_envs: int, duration: float,
     checkpoint = torch.load(checkpoint_path, map_location=env.device)
     actor.load_state_dict(checkpoint["actor"])
     
-    # Load observation normalization stats if both are available
+    # Load observation normalization stats.
+    # Older checkpoints store obs_var (plus obs_count) instead of obs_std.
     if "obs_mean" in checkpoint and "obs_std" in checkpoint:
         obs_mean = checkpoint["obs_mean"].to(env.device)
         obs_std = checkpoint["obs_std"].to(env.device)
+    elif "obs_mean" in checkpoint and "obs_var" in checkpoint:
+        obs_mean = checkpoint["obs_mean"].to(env.device)
+        obs_std = torch.sqrt(checkpoint["obs_var"].to(env.device) + 1e-8)
     else:
-        # No normalization - use identity transform
+        # No normalization stats found - fallback to identity transform.
         obs_mean = torch.zeros(obs_dim, device=env.device)
         obs_std = torch.ones(obs_dim, device=env.device)
     
@@ -576,27 +682,27 @@ def run_hover_eval(checkpoint_path: str, num_envs: int, duration: float,
     
     # Reset environment
     obs_dict, _ = env.reset()
+    _apply_firmware_aligned_policy_state(env, motors_off=False)
     obs = obs_dict["policy"]
+    obs = env._get_observations()["policy"]
     
-    # Set fixed hover goal for all environments
-    env._goal_pos[:, 0] = fixed_goal[0]
-    env._goal_pos[:, 1] = fixed_goal[1]
-    env._goal_pos[:, 2] = fixed_goal[2]
-    print(f"  Fixed goal set to: ({fixed_goal[0]:.2f}, {fixed_goal[1]:.2f}, {fixed_goal[2]:.2f})m")
+    # Set fixed hover goal for all environments in each env's local origin frame
+    env._goal_pos[:, 0] = env._terrain.env_origins[:, 0] + fixed_goal[0]
+    env._goal_pos[:, 1] = env._terrain.env_origins[:, 1] + fixed_goal[1]
+    env._goal_pos[:, 2] = env._terrain.env_origins[:, 2] + fixed_goal[2]
+    print(
+        "  Fixed local goal set (env0 world): "
+        f"({env._goal_pos[0, 0].item():.2f}, {env._goal_pos[0, 1].item():.2f}, {env._goal_pos[0, 2].item():.2f})m"
+    )
     
-    # Apply realistic ground-start override (after reset + goal set)
-    if realistic:
-        dt = cfg.sim.dt
-        _apply_realistic_ground_start(env, num_envs, dt)
-        # Re-acquire observations from the new ground-level state
-        obs_dict = env._get_observations()
-        obs = obs_dict["policy"]
-        print(f"  Ground-start applied: z={env._robot.data.root_pos_w[0, 2].item():.3f}m, motors=OFF")
+    # No realistic ground-start override for hover mode (legacy behavior).
     
     # Compute number of steps
     dt = cfg.sim.dt
     num_steps = int(duration / dt)
     hold_steps = int(hold_time / dt)
+    action_smoother = _FirmwareActionSmoother(num_envs, action_dim, env.device)
+    action_smoother.reset()
     
     # Target reaching criteria (within 10cm of 3D goal position)
     goal_threshold = 0.10  # 10cm tolerance
@@ -617,14 +723,25 @@ def run_hover_eval(checkpoint_path: str, num_envs: int, duration: float,
             
             # Get action
             with torch.no_grad():
-                action = actor.get_action(obs_norm, deterministic=True)
+                raw_action = actor.get_action(obs_norm, deterministic=True)
+                action = action_smoother.step(raw_action)
             
             # Step environment
             obs_dict, reward, terminated, truncated, info = env.step(action)
             obs = obs_dict["policy"]
             
             # Log data
-            logger.log_step(env, dt, target=fixed_goal)
+            env0_goal = (
+                float(env._goal_pos[0, 0].item()),
+                float(env._goal_pos[0, 1].item()),
+                float(env._goal_pos[0, 2].item()),
+            )
+            logger.log_step(
+                env,
+                dt,
+                target=env0_goal,
+                reset_flag=bool((terminated[0] | truncated[0]).item()),
+            )
             
             # Check target reaching (3D distance to fixed goal)
             drone_pos = env._robot.data.root_pos_w
@@ -748,10 +865,13 @@ def run_pointnav_eval(checkpoint_path: str, num_envs: int, duration: float,
     cfg = CrazyfliePointNavEnvCfg()
     cfg.scene.num_envs = num_envs
     cfg.episode_length_s = duration + 1.0
+    cfg.debug_vis = False  # Keep eval logs cleaner in headless runs
+    pointnav_target_z = goal_z if goal_z is not None else cfg.goal_height
+    _configure_stable_eval_cfg(cfg, pointnav_target_z)
+    _configure_firmware_actuator_cfg(cfg)
     
     if realistic:
-        target_height = goal_z if goal_z is not None else cfg.goal_height
-        _configure_realistic_cfg(cfg, target_height)
+        _configure_realistic_cfg(cfg, pointnav_target_z)
     
     # Use fixed goal if specified
     use_fixed_goal = target_x is not None and target_y is not None
@@ -792,12 +912,16 @@ def run_pointnav_eval(checkpoint_path: str, num_envs: int, duration: float,
     checkpoint = torch.load(checkpoint_path, map_location=env.device)
     actor.load_state_dict(checkpoint["actor"])
     
-    # Load observation normalization stats if both are available
+    # Load observation normalization stats.
+    # Older checkpoints store obs_var (plus obs_count) instead of obs_std.
     if "obs_mean" in checkpoint and "obs_std" in checkpoint:
         obs_mean = checkpoint["obs_mean"].to(env.device)
         obs_std = checkpoint["obs_std"].to(env.device)
+    elif "obs_mean" in checkpoint and "obs_var" in checkpoint:
+        obs_mean = checkpoint["obs_mean"].to(env.device)
+        obs_std = torch.sqrt(checkpoint["obs_var"].to(env.device) + 1e-8)
     else:
-        # No normalization - use identity transform
+        # No normalization stats found - fallback to identity transform.
         obs_mean = torch.zeros(obs_dim, device=env.device)
         obs_std = torch.ones(obs_dim, device=env.device)
     
@@ -808,19 +932,24 @@ def run_pointnav_eval(checkpoint_path: str, num_envs: int, duration: float,
     
     # Reset environment
     obs_dict, _ = env.reset()
+    _apply_firmware_aligned_policy_state(env, motors_off=realistic)
     obs = obs_dict["policy"]
+    obs = env._get_observations()["policy"]
     
     # Override goal positions if fixed goal specified
     if fixed_goal_pos is not None:
-        env._goal_pos[:, 0] = fixed_goal_pos[0]
-        env._goal_pos[:, 1] = fixed_goal_pos[1]
-        env._goal_pos[:, 2] = fixed_goal_pos[2]
+        env._goal_pos[:, 0] = env._terrain.env_origins[:, 0] + fixed_goal_pos[0]
+        env._goal_pos[:, 1] = env._terrain.env_origins[:, 1] + fixed_goal_pos[1]
+        env._goal_pos[:, 2] = env._terrain.env_origins[:, 2] + fixed_goal_pos[2]
         # Update previous distance for progress reward
         drone_pos = env._robot.data.root_pos_w
         dist_xy = torch.sqrt((drone_pos[:, 0] - env._goal_pos[:, 0])**2 + 
                              (drone_pos[:, 1] - env._goal_pos[:, 1])**2)
         env._prev_dist_xy = dist_xy
-        print(f"  Fixed goal set to: ({fixed_goal_pos[0]:.2f}, {fixed_goal_pos[1]:.2f}, {fixed_goal_pos[2]:.2f})m")
+        print(
+            "  Fixed local goal set (env0 world): "
+            f"({env._goal_pos[0, 0].item():.2f}, {env._goal_pos[0, 1].item():.2f}, {env._goal_pos[0, 2].item():.2f})m"
+        )
     
     # Apply realistic ground-start override
     if realistic:
@@ -834,6 +963,8 @@ def run_pointnav_eval(checkpoint_path: str, num_envs: int, duration: float,
     dt = cfg.sim.dt
     num_steps = int(duration / dt)
     hold_steps = int(hold_time / dt)
+    action_smoother = _FirmwareActionSmoother(num_envs, action_dim, env.device)
+    action_smoother.reset()
     
     # Goal reaching criteria (within 10cm of goal)
     goal_threshold = 0.10  # 10cm tolerance
@@ -854,7 +985,8 @@ def run_pointnav_eval(checkpoint_path: str, num_envs: int, duration: float,
             
             # Get action
             with torch.no_grad():
-                action = actor.get_action(obs_norm, deterministic=True)
+                raw_action = actor.get_action(obs_norm, deterministic=True)
+                action = action_smoother.step(raw_action)
             
             # Step environment
             obs_dict, reward, terminated, truncated, info = env.step(action)
@@ -862,7 +994,12 @@ def run_pointnav_eval(checkpoint_path: str, num_envs: int, duration: float,
             
             # Log data - get current goal position from environment
             avg_goal = env._goal_pos.mean(dim=0).cpu().numpy()
-            logger.log_step(env, dt, target=(float(avg_goal[0]), float(avg_goal[1]), float(avg_goal[2])))
+            logger.log_step(
+                env,
+                dt,
+                target=(float(avg_goal[0]), float(avg_goal[1]), float(avg_goal[2])),
+                reset_flag=bool((terminated[0] | truncated[0]).item()),
+            )
             
             # Check goal reaching (3D distance)
             drone_pos = env._robot.data.root_pos_w
@@ -977,6 +1114,8 @@ def main():
     
     # Run evaluation
     if args.mode == "hover":
+        if args.realistic:
+            print("[Info] --realistic is ignored in hover mode. Using legacy mid-air hover start.")
         stats = run_hover_eval(
             checkpoint_path=checkpoint_path,
             num_envs=args.num_envs,
@@ -985,7 +1124,7 @@ def main():
             no_plot=args.no_plot,
             target_z=args.target_z,
             hold_time=args.hold_time,
-            realistic=args.realistic
+            realistic=False
         )
     else:  # pointnav
         stats = run_pointnav_eval(

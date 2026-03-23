@@ -80,8 +80,8 @@ tests/
 /2.7.0+cu128
 
 /.venv
-/checkpoints_pointnav/
-/checkpoints_pointnav_v2/
+checkpoints_pointnav/
+checkpoints_pointnav_v2/
 CrazyFlie_WebUI/cache/
 # Nested git repo with its own submodules
 temp_l2f_controller/

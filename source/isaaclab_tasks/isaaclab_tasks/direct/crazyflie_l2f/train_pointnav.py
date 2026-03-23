@@ -264,6 +264,8 @@ class CrazyfliePointNavEnvCfg(DirectRLEnvCfg):
     nav_timeout_penalty = 0.0  # No penalty for timeout (just lack of reach bonus)
     nav_braking_weight = 1.0  # Reward for slowing down near goal (within braking_radius)
     nav_braking_radius = 0.3  # Start braking reward when within 30cm of goal
+    nav_hold_step_weight = 0.5  # Per-step reward while inside goal radius and stabilizing
+    nav_hold_bonus = 100.0  # Bonus when hold duration requirement is first satisfied
     
     # Height control rewards
     # FIXED: height_recovery is now delta-based (reward for climbing, not for being low)
@@ -287,6 +289,7 @@ class CrazyfliePointNavEnvCfg(DirectRLEnvCfg):
     goal_max_distance = 0.5  # Maximum distance (start small, can curriculum)
     goal_height = 1.0  # Goals at same height as spawn for now
     goal_reach_threshold = 0.1  # Within 10cm = success
+    goal_hold_steps = 50  # Require 50 consecutive in-goal steps (0.5s @ 100Hz)
     
     # Position error clipping for observations
     # CRITICAL: Must be >= goal_max_distance so policy can "see" goals
@@ -491,6 +494,9 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         
         # Track if goal was reached this episode
         self._goal_reached = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # Track sustained hold inside goal radius
+        self._goal_hold_counter = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
+        self._goal_held = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         
         # Episode statistics
         self._episode_sums = {
@@ -503,10 +509,13 @@ class CrazyfliePointNavEnv(DirectRLEnv):
             "hover_reward": torch.zeros(self.num_envs, device=self.device),
             "progress_reward": torch.zeros(self.num_envs, device=self.device),
             "braking_reward": torch.zeros(self.num_envs, device=self.device),
+            "hold_step_reward": torch.zeros(self.num_envs, device=self.device),
+            "hold_bonus": torch.zeros(self.num_envs, device=self.device),
             "speed_penalty": torch.zeros(self.num_envs, device=self.device),
             "reach_bonus": torch.zeros(self.num_envs, device=self.device),
             "total_reward": torch.zeros(self.num_envs, device=self.device),
             "goal_reached": torch.zeros(self.num_envs, device=self.device),
+            "goal_held": torch.zeros(self.num_envs, device=self.device),
             "final_distance": torch.zeros(self.num_envs, device=self.device),
         }
         
@@ -928,13 +937,25 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         # Update previous XY distance
         self._prev_dist_xy = dist_xy.clone()
         
-        # Reach bonus: sparse reward for reaching goal (XY distance for planar nav)
-        # Using XY distance so height deviation doesn't block reach
-        just_reached = (dist_xy < cfg.goal_reach_threshold) & (~self._goal_reached)
+        # Reach bonus: sparse reward for first entry into goal radius (XY distance)
+        # Using XY distance so height deviation doesn't block reach.
+        in_goal = dist_xy < cfg.goal_reach_threshold
+        just_reached = in_goal & (~self._goal_reached)
         reach_bonus = just_reached.float() * cfg.nav_reach_bonus
         
-        # Mark goals as reached
-        self._goal_reached = self._goal_reached | (dist_xy < cfg.goal_reach_threshold)
+        # Mark goals as reached (touch) and accumulate consecutive hold steps.
+        self._goal_reached = self._goal_reached | in_goal
+        self._goal_hold_counter = torch.where(
+            in_goal,
+            self._goal_hold_counter + 1,
+            torch.zeros_like(self._goal_hold_counter)
+        )
+        newly_held = (self._goal_hold_counter >= cfg.goal_hold_steps) & (~self._goal_held)
+        self._goal_held = self._goal_held | (self._goal_hold_counter >= cfg.goal_hold_steps)
+
+        # Hold rewards: encourage staying settled at the goal, not only touching it.
+        hold_step_reward = cfg.nav_hold_step_weight * in_goal.float() * hover_reward
+        hold_bonus = newly_held.float() * cfg.nav_hold_bonus
         
         # Braking reward: reward for slowing down when near goal (XY speed)
         # This teaches "go fast → slow down → stabilize" behavior
@@ -980,7 +1001,11 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         # TOTAL REWARD
         # =====================================================================
         
-        reward = hover_reward + progress_reward + braking_reward + height_tracking_reward + height_recovery_reward + speed_penalty + low_height_penalty + reach_bonus
+        reward = (
+            hover_reward + progress_reward + braking_reward + hold_step_reward + hold_bonus +
+            height_tracking_reward + height_recovery_reward + speed_penalty + low_height_penalty +
+            reach_bonus
+        )
         
         # Track stats
         self._episode_sums["height_cost"] += height_cost
@@ -992,10 +1017,13 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         self._episode_sums["hover_reward"] += hover_reward
         self._episode_sums["progress_reward"] += progress_reward
         self._episode_sums["braking_reward"] += braking_reward
+        self._episode_sums["hold_step_reward"] += hold_step_reward
+        self._episode_sums["hold_bonus"] += hold_bonus
         self._episode_sums["speed_penalty"] += speed_penalty
         self._episode_sums["reach_bonus"] += reach_bonus
         self._episode_sums["total_reward"] += reward
         self._episode_sums["goal_reached"] += just_reached.float()
+        self._episode_sums["goal_held"] += newly_held.float()
         self._episode_sums["final_distance"] = dist_xy  # Overwrite with current (XY distance)
         
         return reward
@@ -1142,8 +1170,8 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         # Safety terminations
         safety_terminated = xy_exceeded | too_low | too_high | too_tilted | lin_vel_exceeded | ang_vel_exceeded
         
-        # Goal reached termination (success!)
-        goal_terminated = self._goal_reached
+        # Goal hold termination (success after sustained hold)
+        goal_terminated = self._goal_held
         
         terminated = safety_terminated | goal_terminated
         
@@ -1168,6 +1196,15 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         2. At most goal_max_distance away from spawn
         3. At the specified goal height
         """
+        fixed_goal = getattr(self, "_eval_fixed_goal", None)
+        if fixed_goal is not None:
+            goal = self._terrain.env_origins[env_ids].clone()
+            goal[:, 0] += fixed_goal[0]
+            goal[:, 1] += fixed_goal[1]
+            goal[:, 2] += fixed_goal[2]
+            self._goal_pos[env_ids] = goal
+            return
+
         n = len(env_ids)
         cfg = self.cfg
         
@@ -1225,9 +1262,12 @@ class CrazyfliePointNavEnv(DirectRLEnv):
                     if steps > 0:
                         extras[f"Episode/{key}"] = avg / steps
             
-            # Compute reach rate
-            reach_count = self._goal_reached[env_ids].float().sum().item()
-            extras["Episode/reach_rate"] = reach_count / len(env_ids)
+            # Compute touch and hold rates
+            touch_count = self._goal_reached[env_ids].float().sum().item()
+            hold_count = self._goal_held[env_ids].float().sum().item()
+            extras["Episode/reach_rate"] = hold_count / len(env_ids)
+            extras["Episode/touch_rate"] = touch_count / len(env_ids)
+            extras["Episode/hold_rate"] = hold_count / len(env_ids)
             
             self.extras["log"] = extras
         
@@ -1243,6 +1283,8 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         
         # Reset goal-reached flag
         self._goal_reached[env_ids] = False
+        self._goal_hold_counter[env_ids] = 0
+        self._goal_held[env_ids] = False
         
         # Guidance: spawn perfectly at target with some probability
         guidance_mask = torch.rand(n, device=self.device) < cfg.init_guidance_probability
@@ -1764,6 +1806,7 @@ def train(env: CrazyfliePointNavEnv, agent: L2FPPOAgent, args):
     
     best_reward = float("-inf")
     best_reach_rate = 0.0
+    best_touch_event_rate = 0.0
     
     print(f"\n{'='*60}")
     print("Starting L2F Point Navigation PPO Training")
@@ -1816,8 +1859,13 @@ def train(env: CrazyfliePointNavEnv, agent: L2FPPOAgent, args):
         episode_rewards = torch.zeros(num_envs, device=env.device)
         reach_count = 0
         episode_count = 0
+        touch_events = 0.0
+        hold_events = 0.0
         
         for step in range(steps_per_rollout):
+            prev_goal_reached = env._goal_reached.clone()
+            prev_goal_held = env._goal_held.clone()
+
             action, log_prob, value = agent.get_action_and_value(obs)
             
             obs_buffer.append(obs)
@@ -1828,6 +1876,11 @@ def train(env: CrazyfliePointNavEnv, agent: L2FPPOAgent, args):
             obs_dict, reward, terminated, truncated, info = env.step(action)
             next_obs = obs_dict["policy"]
             done = terminated | truncated
+
+            # Track rollout-level transitions independent of episode resets.
+            # This avoids misleading 0% metrics when no episodes end in-window.
+            touch_events += (env._goal_reached & (~prev_goal_reached)).sum().item()
+            hold_events += (env._goal_held & (~prev_goal_held)).sum().item()
             
             reward_buffer.append(reward)
             done_buffer.append(done)
@@ -1871,6 +1924,8 @@ def train(env: CrazyfliePointNavEnv, agent: L2FPPOAgent, args):
         mean_reward = episode_rewards.mean().item() / steps_per_rollout
         mean_return = returns_flat.mean().item()
         reach_rate = reach_count / max(episode_count, 1) if episode_count > 0 else 0.0
+        touch_event_rate = touch_events / max(num_envs, 1)
+        hold_event_rate = hold_events / max(num_envs, 1)
         
         # Check for best model
         is_best = mean_reward > best_reward
@@ -1878,15 +1933,23 @@ def train(env: CrazyfliePointNavEnv, agent: L2FPPOAgent, args):
             best_reward = mean_reward
             agent.save(os.path.join(checkpoint_dir, "best_model.pt"), iteration, best_reward)
         
-        if reach_rate > best_reach_rate:
-            best_reach_rate = reach_rate
+        if hold_event_rate > best_reach_rate:
+            best_reach_rate = hold_event_rate
             agent.save(os.path.join(checkpoint_dir, "best_reach_model.pt"), iteration, best_reward)
+
+        if touch_event_rate > best_touch_event_rate:
+            best_touch_event_rate = touch_event_rate
+            agent.save(os.path.join(checkpoint_dir, "best_touch_model.pt"), iteration, best_reward)
         
         # Log progress
         if iteration % 10 == 0 or is_best:
             std = torch.exp(agent.actor.log_std).mean().item()
             star = " *BEST*" if is_best else ""
-            print(f"[Iter {iteration:4d}] Reward: {mean_reward:8.3f} | Reach: {reach_rate*100:5.1f}% | Std: {std:.3f} | Loss: {loss:.4f}{star}")
+            print(
+                f"[Iter {iteration:4d}] Reward: {mean_reward:8.3f} | "
+                f"HoldEvt/env: {hold_event_rate:5.3f} | TouchEvt/env: {touch_event_rate:5.3f} | "
+                f"EpHold: {reach_rate*100:5.1f}% | Std: {std:.3f} | Loss: {loss:.4f}{star}"
+            )
         
         # Print comprehensive diagnostics every 50 iterations
         if iteration > 0 and iteration % 50 == 0:
@@ -1937,7 +2000,11 @@ def train(env: CrazyfliePointNavEnv, agent: L2FPPOAgent, args):
     
     # Save final model
     agent.save(os.path.join(checkpoint_dir, "final_model.pt"), args.max_iterations, best_reward)
-    print(f"\nTraining complete! Best reward: {best_reward:.3f}, Best reach rate: {best_reach_rate*100:.1f}%")
+    print(
+        f"\nTraining complete! Best reward: {best_reward:.3f}, "
+        f"Best hold events/env: {best_reach_rate:.3f}, "
+        f"Best touch events/env: {best_touch_event_rate:.3f}"
+    )
     print(f"Checkpoints saved to: {checkpoint_dir}")
 
 
@@ -1985,7 +2052,7 @@ def play(env: CrazyfliePointNavEnv, agent: L2FPPOAgent, checkpoint_path: str):
             
             # Track reaches
             if done.any():
-                reaches = env._goal_reached[done].sum().item()
+                reaches = env._goal_held[done].sum().item()
                 reach_count += reaches
                 episode_count += done.sum().item()
             

@@ -45,12 +45,15 @@ def parse_args():
     
     # Mode selection
     parser.add_argument("--play", action="store_true", help="Run in play mode with trained model")
-    parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint for play mode")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Path to checkpoint for play mode or warm-start training")
     
     # Training parameters  
     parser.add_argument("--num_envs", type=int, default=4096, help="Number of environments")
     parser.add_argument("--max_iterations", type=int, default=500, help="Maximum training iterations")
     parser.add_argument("--save_interval", type=int, default=50, help="Save checkpoint every N iterations")
+    parser.add_argument("--target_z", type=float, default=1.0,
+                        help="Target hover height in meters for training/eval (default: 1.0)")
     
     # Hyperparameters (tuned for quadrotor)
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
@@ -1051,6 +1054,21 @@ def train(env: CrazyflieL2FEnv, agent: L2FPPOAgent, args):
     num_envs = env.num_envs
     
     best_reward = float("-inf")
+
+    # Optional warm-start from an existing checkpoint.
+    if args.checkpoint:
+        if os.path.exists(args.checkpoint):
+            try:
+                loaded_iter, loaded_best = agent.load(args.checkpoint)
+                print(f"[Warm Start] Loaded weights from: {args.checkpoint}")
+                print(f"[Warm Start] Source iteration: {loaded_iter}, source best reward: {loaded_best:.3f}")
+            except Exception as exc:
+                print(f"[Warm Start] Failed to load checkpoint: {args.checkpoint}")
+                print(f"[Warm Start] Reason: {exc}")
+                print("[Warm Start] Continuing from scratch.")
+        else:
+            print(f"[Warm Start] Checkpoint not found: {args.checkpoint}")
+            print("[Warm Start] Continuing from scratch.")
     
     print(f"\n{'='*60}")
     print("Starting L2F-Compatible PPO Training")
@@ -1213,6 +1231,7 @@ def main():
     # Create config
     cfg = CrazyflieL2FEnvCfg()
     cfg.scene.num_envs = args.num_envs
+    cfg.init_target_height = args.target_z
     
     # Create environment
     env = CrazyflieL2FEnv(cfg)
