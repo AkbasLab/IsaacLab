@@ -12,9 +12,10 @@ build_firmware/
 *.elf
 *.map
 
-# Checkpoints (keep only best_model.pt in repo)
-checkpoints/checkpoint_*.pt
-checkpoints/final_model.pt
+# Checkpoints
+checkpoints/
+checkpoints_*/
+checkpoints*/
 
 # Generated files
 calibration_report.json
@@ -39,5 +40,4 @@ Thumbs.db
 # Logs
 *.log
 logs/
-checkpoints/
 checkpoints_nav/

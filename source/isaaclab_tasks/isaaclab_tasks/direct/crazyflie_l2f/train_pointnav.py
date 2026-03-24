@@ -288,8 +288,11 @@ class CrazyfliePointNavEnvCfg(DirectRLEnvCfg):
     goal_min_distance = 0.2  # Minimum distance from spawn (prevents overlap)
     goal_max_distance = 0.5  # Maximum distance (start small, can curriculum)
     goal_height = 1.0  # Goals at same height as spawn for now
+    goal_height_min = 1.0  # Optional random goal-height range lower bound
+    goal_height_max = 1.0  # Optional random goal-height range upper bound
     goal_reach_threshold = 0.1  # Within 10cm = success
     goal_hold_steps = 50  # Require 50 consecutive in-goal steps (0.5s @ 100Hz)
+    use_3d_goal_distance = False  # If True, use full 3D distance for reach/hold/progress
     
     # Position error clipping for observations
     # CRITICAL: Must be >= goal_max_distance so policy can "see" goals
@@ -300,6 +303,8 @@ class CrazyfliePointNavEnvCfg(DirectRLEnvCfg):
     # INITIALIZATION (same as hover with small perturbations)
     # =========================================================================
     init_target_height = 1.0  # m - spawn height
+    init_target_height_min = 1.0  # Optional random spawn-height range lower bound
+    init_target_height_max = 1.0  # Optional random spawn-height range upper bound
     init_height_offset_min = -0.05  # Small height perturbation
     init_height_offset_max = 0.05
     init_max_xy_offset = 0.0  # Spawn at origin, goal is offset
@@ -862,6 +867,18 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         ], dim=-1)
         
         return {"policy": obs}
+
+    def _goal_delta(self, pos_w: torch.Tensor, env_ids: torch.Tensor | None = None) -> torch.Tensor:
+        """Return goal minus position for the selected environments."""
+        goal_pos = self._goal_pos if env_ids is None else self._goal_pos[env_ids]
+        return goal_pos - pos_w
+
+    def _goal_distance(self, pos_w: torch.Tensor, env_ids: torch.Tensor | None = None) -> torch.Tensor:
+        """Compute the configured goal distance metric."""
+        delta = self._goal_delta(pos_w, env_ids)
+        if self.cfg.use_3d_goal_distance:
+            return torch.norm(delta, dim=-1)
+        return torch.norm(delta[:, :2], dim=-1)
     
     def _get_rewards(self) -> torch.Tensor:
         """Compute reward: hover stability costs + navigation rewards.
@@ -920,26 +937,23 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         # NAVIGATION REWARDS (new for pointnav)
         # =====================================================================
         
-        # Progress reward: decrease in XY distance (dense)
-        # FIXED: Use XY distance only - decouple navigation from altitude
-        delta_xy = pos_w[:, :2] - self._goal_pos[:, :2]
-        dist_xy = torch.norm(delta_xy, dim=-1)
+        # Progress reward: decrease in configured goal distance (XY or 3D).
+        dist_to_goal = self._goal_distance(pos_w)
         
         # Gate hover reward by distance to goal
         # Far from goal: hover_reward * 0.2 (can't farm stability reward)
         # Near goal: hover_reward * 1.0 (full reward for precision)
-        gate = torch.clamp(1.0 - (dist_xy / cfg.hover_gate_radius), 0.0, 1.0)
+        gate = torch.clamp(1.0 - (dist_to_goal / cfg.hover_gate_radius), 0.0, 1.0)
         hover_gate = cfg.hover_gate_min + (1.0 - cfg.hover_gate_min) * gate
         hover_reward = hover_reward * hover_gate
-        progress = self._prev_dist_xy - dist_xy  # positive when getting closer
+        progress = self._prev_dist_xy - dist_to_goal  # positive when getting closer
         progress_reward = cfg.nav_progress_weight * progress
         
-        # Update previous XY distance
-        self._prev_dist_xy = dist_xy.clone()
+        # Update previous goal distance
+        self._prev_dist_xy = dist_to_goal.clone()
         
-        # Reach bonus: sparse reward for first entry into goal radius (XY distance)
-        # Using XY distance so height deviation doesn't block reach.
-        in_goal = dist_xy < cfg.goal_reach_threshold
+        # Reach bonus: sparse reward for first entry into goal radius.
+        in_goal = dist_to_goal < cfg.goal_reach_threshold
         just_reached = in_goal & (~self._goal_reached)
         reach_bonus = just_reached.float() * cfg.nav_reach_bonus
         
@@ -954,14 +968,14 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         self._goal_held = self._goal_held | (self._goal_hold_counter >= cfg.goal_hold_steps)
 
         # Hold rewards: encourage staying settled at the goal, not only touching it.
-        hold_step_reward = cfg.nav_hold_step_weight * in_goal.float() * hover_reward
+        hold_step_reward = cfg.nav_hold_step_weight * in_goal.float() * (hover_reward + 1.0)
         hold_bonus = newly_held.float() * cfg.nav_hold_bonus
         
         # Braking reward: reward for slowing down when near goal (XY speed)
         # This teaches "go fast → slow down → stabilize" behavior
-        v_xy = torch.norm(lin_vel[:, :2], dim=-1)  # XY speed only
-        near_goal = dist_xy < cfg.nav_braking_radius
-        speed_reduction = self._prev_speed - v_xy  # positive when slowing down
+        speed_now = torch.norm(lin_vel, dim=-1) if cfg.use_3d_goal_distance else torch.norm(lin_vel[:, :2], dim=-1)
+        near_goal = dist_to_goal < cfg.nav_braking_radius
+        speed_reduction = self._prev_speed - speed_now  # positive when slowing down
         braking_reward = torch.where(
             near_goal,
             cfg.nav_braking_weight * speed_reduction,
@@ -969,7 +983,7 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         )
         
         # Update previous speed for next step
-        self._prev_speed = v_xy.clone()
+        self._prev_speed = speed_now.clone()
         
         # Height tracking reward: Gaussian centered at target height
         # Rewards staying near target, decays smoothly with distance
@@ -988,7 +1002,7 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         
         # Speed penalty: penalize going too fast horizontally (XY speed only)
         # Don't punish vertical corrections
-        speed_excess = torch.relu(v_xy - cfg.nav_speed_penalty_threshold)
+        speed_excess = torch.relu(speed_now - cfg.nav_speed_penalty_threshold)
         speed_penalty = -cfg.nav_speed_penalty_weight * speed_excess ** 2
         
         # Low-height penalty: asymmetric quadratic penalty for being below floor
@@ -1024,7 +1038,7 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         self._episode_sums["total_reward"] += reward
         self._episode_sums["goal_reached"] += just_reached.float()
         self._episode_sums["goal_held"] += newly_held.float()
-        self._episode_sums["final_distance"] = dist_xy  # Overwrite with current (XY distance)
+        self._episode_sums["final_distance"] = dist_to_goal  # Overwrite with current distance
         
         return reward
     
@@ -1220,11 +1234,17 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         x_offset = distance * torch.cos(angle)
         y_offset = distance * torch.sin(angle)
         
+        goal_height_min = getattr(self, "_goal_height_min", cfg.goal_height_min)
+        goal_height_max = getattr(self, "_goal_height_max", cfg.goal_height_max)
+        goal_height = torch.empty(n, device=self.device).uniform_(goal_height_min, goal_height_max)
+        if abs(goal_height_max - goal_height_min) <= 1e-6:
+            goal_height.fill_(goal_height_min)
+
         # Goal position = spawn origin + offset
         goal = self._terrain.env_origins[env_ids].clone()
         goal[:, 0] += x_offset
         goal[:, 1] += y_offset
-        goal[:, 2] = goal[:, 2] + cfg.goal_height  # Set goal height
+        goal[:, 2] = goal[:, 2] + goal_height
         
         self._goal_pos[env_ids] = goal
         
@@ -1300,12 +1320,18 @@ class CrazyfliePointNavEnv(DirectRLEnv):
             -cfg.init_max_xy_offset, cfg.init_max_xy_offset
         )
         
-        # Height: target height + random offset
+        spawn_height_min = getattr(self, "_spawn_height_min", cfg.init_target_height_min)
+        spawn_height_max = getattr(self, "_spawn_height_max", cfg.init_target_height_max)
+        spawn_height = torch.empty(n, device=self.device).uniform_(spawn_height_min, spawn_height_max)
+        if abs(spawn_height_max - spawn_height_min) <= 1e-6:
+            spawn_height.fill_(spawn_height_min)
+
+        # Height: independently sampled spawn height + random offset
         height_offset = torch.empty(n, device=self.device).uniform_(
             cfg.init_height_offset_min, cfg.init_height_offset_max
         )
         height_offset[guidance_mask] = 0
-        pos[:, 2] = cfg.init_target_height + height_offset
+        pos[:, 2] = spawn_height + height_offset
         pos = pos + self._terrain.env_origins[env_ids]
         
         # Sample orientation (small random quaternion)
@@ -1347,15 +1373,14 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         self._action_history[env_ids] = self._hover_action
         self._actions[env_ids] = self._hover_action
         
-        # Initialize previous XY distance to goal
-        delta_xy = self._goal_pos[env_ids, :2] - pos[:, :2]
-        self._prev_dist_xy[env_ids] = torch.norm(delta_xy, dim=-1)
+        # Initialize previous distance to goal using the configured metric.
+        self._prev_dist_xy[env_ids] = self._goal_distance(pos, env_ids)
         
         # Initialize previous speed to zero (drone starts at rest)
         self._prev_speed[env_ids] = 0.0
         
-        # Initialize previous height deficit to zero (starts at target height)
-        self._prev_height_below_target[env_ids] = 0.0
+        # Initialize previous height deficit from the true goal height.
+        self._prev_height_below_target[env_ids] = torch.clamp(self._goal_pos[env_ids, 2] - pos[:, 2], min=0.0)
         
         # Sample disturbances
         if cfg.enable_disturbance:

@@ -21,12 +21,14 @@ from isaaclab.assets import ArticulationCfg
 # Get the path to the URDF file relative to this config file
 _CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 CRAZYFLIE_21_URDF_PATH = os.path.join(_CURRENT_DIR, "assets", "crazyflie_21.urdf")
+CRAZYFLIE_21_USD_DIR = os.path.join(_CURRENT_DIR, "assets", "usd_cache", "crazyflie_21")
 
 # Crazyflie 2.1 Configuration - L2F accurate parameters
 CRAZYFLIE_21_CFG = ArticulationCfg(
     prim_path="{ENV_REGEX_NS}/Robot",
     spawn=sim_utils.UrdfFileCfg(
         asset_path=CRAZYFLIE_21_URDF_PATH,
+        usd_dir=CRAZYFLIE_21_USD_DIR,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
             max_depenetration_velocity=10.0,
