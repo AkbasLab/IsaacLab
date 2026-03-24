@@ -1,288 +1,190 @@
-# Crazyflie PPO Hover Pipeline - Complete Guide
+# Crazyflie L2F Training Pipeline
 
-Complete pipeline for training a PPO hover policy in Isaac Lab and deploying it to a physical Crazyflie 2.1.
+Current training and evaluation flow for the Crazyflie 2.1 point-navigation and precision-hold policies in Isaac Lab.
 
-**Last Updated:** January 21, 2026  
-**Status:** Fully Functional
-
----
-
-## Prerequisites
-
-- **Isaac Sim 4.5+** installed
-- **Docker Desktop** with WSL2 backend
-- **Crazyflie 2.1** with Crazyradio PA
-- **cflib** Python package (`pip install cflib`)
+**Last Updated:** March 23, 2026  
+**Status:** Active workflow
 
 ---
 
-## Pipeline Overview
+## Overview
 
-```
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│   TRAIN     │───▶│   EXPORT    │───▶│   BUILD     │───▶│   FLASH     │───▶│   TEST      │
-│  (Isaac)    │    │  (Python)   │    │  (Docker)   │    │ (cfloader)  │    │  (cflib)    │
-└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
-     ~30min             ~5sec             ~2min             ~30sec             Manual
-```
+The current policy lineage is:
 
----
+1. Train a base point-navigation policy with [train_pointnav.py](/d:/coding/Capstone/learning-to-fly/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/direct/crazyflie_l2f/train_pointnav.py)
+2. Fine-tune it for fixed-goal hold with [train_hold_finetune.py](/d:/coding/Capstone/learning-to-fly/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/direct/crazyflie_l2f/train_hold_finetune.py)
+3. Fine-tune again for tighter precision hold from the best phase-3 hold checkpoint
+4. Evaluate fixed-goal behavior with [eval_pointnav_goal.py](/d:/coding/Capstone/learning-to-fly/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/direct/crazyflie_l2f/eval_pointnav_goal.py)
 
-## Step 1: Train the Policy
+Current checkpoint lineage:
 
-### Quick Test (verify setup works)
-```powershell
-cd <LEARNING_TO_FLY_ROOT>\IsaacLab
-
-& "<ISAAC_SIM_PATH>\python.bat" source\isaaclab_tasks\isaaclab_tasks\direct\crazyflie_l2f\train_hover.py --headless --num_envs 16 --max_iterations 2
-```
-
-### Full Training
-```powershell
-cd <LEARNING_TO_FLY_ROOT>\IsaacLab
-
-& "<ISAAC_SIM_PATH>\python.bat" source\isaaclab_tasks\isaaclab_tasks\direct\crazyflie_l2f\train_hover.py --headless --num_envs 4096 --max_iterations 500
-```
-
-### Expected Output
-- Progress: `Iter 50/500 | Reward: 0.XXX | ...`
-- Checkpoints saved to: `source/isaaclab_tasks/.../crazyflie_l2f/checkpoints/`
-- Final reward should be **> 0.6** for good hover
-
-### Training Parameters
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--num_envs` | 4096 | Parallel environments |
-| `--max_iterations` | 500 | Training iterations |
-| `--headless` | False | Run without GUI |
+`checkpoints_pointnav/best_model.pt`  
+-> hold fine-tune phases  
+-> `checkpoints_hold_finetune_phase3_20260323_161844/best_model.pt`  
+-> precision hold fine-tune  
+-> `checkpoints_hold_finetune_tight_20260323_212826/best_model.pt`
 
 ---
 
-## Step 2: Export Policy to Firmware Header
+## Checkpoint Layout
 
-```powershell
-cd <LEARNING_TO_FLY_ROOT>\IsaacLab\source\isaaclab_tasks\isaaclab_tasks\direct\crazyflie_l2f
+Each training directory can contain:
 
-& "<ISAAC_SIM_PATH>\python.bat" export_policy_standalone.py
-```
+- `best_model.pt`: best mean reward checkpoint
+- `best_hold_model.pt`: best hold-event checkpoint
+- `best_proxy_hold_model.pt`: best proxy-hold checkpoint
+- `checkpoint_<N>.pt`: periodic checkpoint
+- `stage_start_<tag>.pt`: curriculum stage start snapshot
+- `stage_complete_<tag>.pt`: curriculum stage completion snapshot
+- `final_model.pt`: final save after training
 
-### What It Does
-1. Loads `checkpoints/best_model.pt`
-2. Converts PyTorch weights to C byte arrays
-3. Writes to `<LEARNING_TO_FLY_ROOT>\controller\data\actor.h`
+Important directories currently in use:
 
-### Verify Export
-```powershell
-# Check file size (should be ~264,000 bytes)
-(Get-Item "<LEARNING_TO_FLY_ROOT>\controller\data\actor.h").Length
-
-# Should see layer statistics in console output:
-# layer_0 weight: mean=X.XXXX, std=0.XXXX (should NOT be 0)
-# layer_1 weight: mean=X.XXXX, std=0.XXXX  
-# layer_2 weight: mean=X.XXXX, std=0.XXXX
-```
+- `checkpoints_pointnav`
+- `checkpoints_hold_finetune`
+- `checkpoints_hold_finetune_phase2_20260323_024001`
+- `checkpoints_hold_finetune_phase3_20260323_161251`
+- `checkpoints_hold_finetune_phase3_20260323_161844`
+- `checkpoints_hold_finetune_tight_20260323_212716`
+- `checkpoints_hold_finetune_tight_20260323_212826`
 
 ---
 
-## Step 3: Build Firmware with Docker
+## Step 1: Base PointNav Training
+
+Train the base 149-dimensional point-navigation policy:
 
 ```powershell
-cd <LEARNING_TO_FLY_ROOT>
-
-# Create output directory (first time only)
-New-Item -ItemType Directory -Path "output" -Force
-
-# Build firmware (adjust WSL mount path to match your installation)
-wsl docker run --rm -v <WSL_LEARNING_TO_FLY_PATH>:/data -v <WSL_LEARNING_TO_FLY_PATH>/output:/output arpllab/learning_to_fly_build_firmware
+.\isaaclab.bat -p source\isaaclab_tasks\isaaclab_tasks\direct\crazyflie_l2f\train_pointnav.py --headless
 ```
 
-### Expected Output
-```
-...
-Build for the cf2!
-Build 0:XXXXXXXX (NA) CLEAN
-Flash |  418128/1032192 (41%),  614064 free
-RAM   |   83816/131072  (64%),   47256 free
-CCM   |   62020/65536   (95%),    3516 free
-```
+Output:
 
-### Verify Build
-```powershell
-# Check firmware was created (~418,000 bytes)
-(Get-Item "<LEARNING_TO_FLY_ROOT>\output\cf2.bin").Length
-```
+- `source\isaaclab_tasks\isaaclab_tasks\direct\crazyflie_l2f\checkpoints_pointnav\best_model.pt`
+
+Notes:
+
+- Observation space is 149 dims: hover state plus 3D goal-relative state
+- This stage learns to travel toward goals, not precision hold
 
 ---
 
-## Step 4: Flash Firmware to Crazyflie
+## Step 2: Hold Fine-Tune
 
-### Put Drone in Bootloader Mode
-1. Turn off the Crazyflie
-2. Hold the power button for **3+ seconds**
-3. Blue LEDs should blink alternately
+Warm-start from the base pointnav checkpoint and fine-tune for fixed-goal hold behavior:
 
-### Flash via Command Line
 ```powershell
-cfloader flash <LEARNING_TO_FLY_ROOT>\output\cf2.bin stm32-fw -w radio://0/80/2M/<YOUR_DRONE_ADDRESS>
+.\isaaclab.bat -p source\isaaclab_tasks\isaaclab_tasks\direct\crazyflie_l2f\train_hold_finetune.py --checkpoint source\isaaclab_tasks\isaaclab_tasks\direct\crazyflie_l2f\checkpoints_pointnav\best_model.pt --target_x 0.0 --target_y 0.0 --target_z 0.3 --z_reference_offset 1.0 --timestamp_checkpoint_dir --checkpoint_dir_name checkpoints_hold_finetune_phase3
 ```
 
-### Alternative: Crazyflie Client (GUI)
-1. Open Crazyflie Client
-2. Connect → Bootloader
-3. Browse to `output/cf2.bin`
-4. Click Flash
+Representative successful output directory:
+
+- `checkpoints_hold_finetune_phase3_20260323_161844`
+
+Key outputs from that directory:
+
+- `best_model.pt`
+- `best_hold_model.pt`
+- `best_proxy_hold_model.pt`
+
+The most commonly used hold checkpoint in the recent workflow was:
+
+- `source\isaaclab_tasks\isaaclab_tasks\direct\crazyflie_l2f\checkpoints_hold_finetune_phase3_20260323_161844\best_model.pt`
 
 ---
 
-## Step 5: Test the Policy
+## Step 3: Precision Hold Fine-Tune
 
-### Scan for Drones
+Continue training from the validated phase-3 hold checkpoint, but tighten the 3D hold radius and emphasize staying exactly on the point.
+
+Current command:
+
 ```powershell
-cd <LEARNING_TO_FLY_ROOT>\IsaacLab\source\isaaclab_tasks\isaaclab_tasks\direct\crazyflie_l2f
-
-python test_hover.py --scan
+.\isaaclab.bat -p source\isaaclab_tasks\isaaclab_tasks\direct\crazyflie_l2f\train_hold_finetune.py --checkpoint source\isaaclab_tasks\isaaclab_tasks\direct\crazyflie_l2f\checkpoints_hold_finetune_phase3_20260323_161844\best_model.pt --target_x 0.0 --target_y 0.0 --target_z 0.3 --z_reference_offset 1.0 --goal_radius 0.03 --spawn_z_min 0.25 --spawn_z_max 0.35 --hold_time 10 --episode_length_s 15 --num_envs 2048 --max_iterations 300 --timestamp_checkpoint_dir --checkpoint_dir_name checkpoints_hold_finetune_tight --headless
 ```
 
-### Run Hover Test
-```powershell
-python test_hover.py --uri radio://0/80/2M/<YOUR_DRONE_ADDRESS> --height 0.3
-```
+What changed in this phase:
 
-### Controls
-| Key | Action |
-|-----|--------|
-| **SPACE** or **ENTER** (hold) | Hover at target height |
-| **Release** | Stop motors immediately |
-| **Q** or **ESC** | Quit program |
-| **Ctrl+C** | Emergency stop |
+- True 3D goal distance is used for hold behavior
+- Goal radius is tightened to `0.03 m`
+- Hold bonus is much stronger than simple touch reward
+- Spawn height is sampled near the target height
+- The objective is "stay very close to the exact point"
 
-### Safety Features
-- Dead-man's switch (motors stop when key released)
-- 5-second connection timeout
-- Automatic disconnect on packet loss
-- Graceful radio cleanup
+Latest known output directory:
+
+- `checkpoints_hold_finetune_tight_20260323_212826`
+
+Current latest checkpoint:
+
+- `source\isaaclab_tasks\isaaclab_tasks\direct\crazyflie_l2f\checkpoints_hold_finetune_tight_20260323_212826\best_model.pt`
 
 ---
 
-## Quick Reference (Copy-Paste)
+## Step 4: Fixed-Goal Evaluation
 
-Replace placeholders before running:
-- `<LEARNING_TO_FLY_ROOT>`: Path to learning-to-fly repository
-- `<ISAAC_SIM_PATH>`: Path to Isaac Sim installation
-- `<WSL_LEARNING_TO_FLY_PATH>`: WSL-style path (e.g., /mnt/c/path/to/learning-to-fly)
-- `<YOUR_DRONE_ADDRESS>`: Crazyflie address (e.g., E7E7E7E7E7)
+Evaluate a checkpoint against a fixed goal with:
 
 ```powershell
-# === FULL PIPELINE ===
-
-# 1. TRAIN
-cd <LEARNING_TO_FLY_ROOT>\IsaacLab
-& "<ISAAC_SIM_PATH>\python.bat" source\isaaclab_tasks\isaaclab_tasks\direct\crazyflie_l2f\train_hover.py --headless --num_envs 4096 --max_iterations 500
-
-# 2. EXPORT
-cd <LEARNING_TO_FLY_ROOT>\IsaacLab\source\isaaclab_tasks\isaaclab_tasks\direct\crazyflie_l2f
-& "<ISAAC_SIM_PATH>\python.bat" export_policy_standalone.py
-
-# 3. BUILD
-cd <LEARNING_TO_FLY_ROOT>
-wsl docker run --rm -v <WSL_LEARNING_TO_FLY_PATH>:/data -v <WSL_LEARNING_TO_FLY_PATH>/output:/output arpllab/learning_to_fly_build_firmware
-
-# 4. FLASH (put drone in bootloader first!)
-cfloader flash <LEARNING_TO_FLY_ROOT>\output\cf2.bin stm32-fw -w radio://0/80/2M/<YOUR_DRONE_ADDRESS>
-
-# 5. TEST
-cd <LEARNING_TO_FLY_ROOT>\IsaacLab\source\isaaclab_tasks\isaaclab_tasks\direct\crazyflie_l2f
-python test_hover.py --height 0.3
+.\isaaclab.bat -p source\isaaclab_tasks\isaaclab_tasks\direct\crazyflie_l2f\eval_pointnav_goal.py --checkpoint source\isaaclab_tasks\isaaclab_tasks\direct\crazyflie_l2f\checkpoints_hold_finetune_tight_20260323_212826\best_model.pt --target_x 0.0 --target_y 0.0 --target_z 0.3 --z_reference_offset 1.0 --deterministic --duration 10 --show_goal_marker --output_dir source\isaaclab_tasks\isaaclab_tasks\direct\crazyflie_l2f\play_eval_results\goal_eval_hold_finetune_tight_best_ground_0p3_vis --kit_args "--/app/vulkan=false --/renderer/multiGpu/maxGpuCount=1 --/renderer/activeGpu=0"
 ```
+
+Notes on the current eval behavior:
+
+- The script uses the explicit checkpoint path you pass
+- `target_z` is interpreted with `z_reference_offset`
+- For height-hold-style eval, the script can start the drone at the commanded `z` height while still allowing lateral XY motion
+
+Outputs:
+
+- `goal_eval_data.csv`
+- `summary.json`
+
+under the selected `play_eval_results/...` directory
 
 ---
 
-## Architecture Details
+## Current Recommended Models
 
-### Network Architecture
-```
-Input (146) → Dense(64, tanh) → Dense(64, tanh) → Dense(4) → Output
-```
+For broad fixed-goal hold:
 
-### Observation Space (146 dimensions)
-| Component | Dims | Description |
-|-----------|------|-------------|
-| Position | 3 | x, y, z in world frame |
-| Rotation | 9 | Flattened 3×3 rotation matrix |
-| Linear velocity | 3 | vx, vy, vz |
-| Angular velocity | 3 | wx, wy, wz |
-| Action history | 128 | 32 timesteps × 4 motors |
+- `checkpoints_hold_finetune_phase3_20260323_161844\best_model.pt`
 
-### Action Space (4 dimensions)
-- Normalized motor commands in **[-1, 1]**
-- Conversion: `rpm = (action + 1) * 0.5 * 21702`
+For tighter precision hold:
 
-### Key Physical Parameters
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| Mass | 0.027 kg | Crazyflie mass |
-| Arm length | 0.046 m | Motor arm length |
-| KF | 3.16e-10 | Thrust coefficient |
-| Max RPM | 21702 | Maximum motor speed |
-| Hover thrust | ~0.334 | Normalized action for hover |
+- `checkpoints_hold_finetune_tight_20260323_212826\best_model.pt`
+
+If comparing checkpoints, keep the eval command identical and change only `--checkpoint`.
 
 ---
 
-## Troubleshooting
-
-### Training
-
-**Out of GPU memory:**
-```powershell
---num_envs 2048  # Reduce parallel environments
-```
-
-**Reward not increasing:**
-- Run more iterations: `--max_iterations 1000`
-- Check environment is resetting properly
-
-### Export
-
-**"Layer weights are all zeros":**
-- Verify checkpoint loaded: check console output for weight statistics
-- Ensure using `export_policy_standalone.py` (has embedded network class)
-
-### Build
-
-**Docker command not found:**
-```powershell
-# Verify Docker is running
-wsl docker --version
-```
-
-**"Cannot create /output/cf2.bin":**
-```powershell
-New-Item -ItemType Directory -Path "<LEARNING_TO_FLY_ROOT>\output" -Force
-```
-
-### Testing
-
-**Connection timeout:**
-- Check Crazyradio is plugged in
-- Scan for drones: `python test_hover.py --scan`
-- Verify URI matches your drone
-
-**Drone flips/unstable:**
-- Retrain with more iterations
-- Check motor ordering in firmware
-- Verify observation normalization
-
----
-
-## Files Reference
+## Key Script Roles
 
 | File | Purpose |
 |------|---------|
-| `train_hover.py` | PPO training script |
-| `export_policy_standalone.py` | Export weights to C header |
-| `test_hover.py` | Dead-man's switch flight test |
-| `crazyflie_l2f_env.py` | Isaac Lab environment |
-| `networks.py` | L2F-compatible actor network |
-| `checkpoints/best_model.pt` | Trained model weights |
-| `controller/data/actor.h` | Exported C header |
-| `output/cf2.bin` | Compiled firmware |
+| `train_pointnav.py` | Base point-navigation PPO training |
+| `train_hold_finetune.py` | Fixed-goal hold and precision-hold fine-tuning |
+| `eval_pointnav_goal.py` | Fixed-goal evaluation with CSV logging |
+| `play_eval.py` | Older interactive/analysis evaluation path |
+| `export_policy_standalone.py` | Export policy weights for deployment |
+| `DEPLOYMENT.md` | Firmware/export/deployment flow |
+
+---
+
+## Common Workflow
+
+Quick practical loop:
+
+1. Train or fine-tune a checkpoint
+2. Evaluate it with `eval_pointnav_goal.py`
+3. Inspect `goal_eval_data.csv`
+4. If the drone holds too loosely, continue precision fine-tuning from the best prior checkpoint
+5. Promote the new `best_model.pt` only after fixed-goal eval improves
+
+---
+
+## Notes
+
+- High training hold rate does not automatically mean clean eval transients; train/eval start-state mismatch matters
+- The precision-hold stage is intended to reduce vertical bias and keep the drone inside a much tighter radius around the exact 3D point
+- Checkpoint folders are gitignored in this task directory

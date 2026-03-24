@@ -287,10 +287,18 @@ def write_csv_header(writer: csv.writer):
         "goal_y",
         "goal_z",
         "goal_z_virtual",
+        "goal_local_x",
+        "goal_local_y",
+        "goal_local_z",
+        "goal_local_z_virtual",
         "pos_x",
         "pos_y",
         "pos_z",
         "pos_z_virtual",
+        "pos_local_x",
+        "pos_local_y",
+        "pos_local_z",
+        "pos_local_z_virtual",
         "vel_x",
         "vel_y",
         "vel_z",
@@ -327,10 +335,15 @@ def append_env0_row(
     quat = env._robot.data.root_quat_w[env_id].detach().cpu()
     ang_vel = env._robot.data.root_ang_vel_b[env_id].detach().cpu()
     goal = env._goal_pos[env_id].detach().cpu()
+    env_origin = env._terrain.env_origins[env_id].detach().cpu()
     roll, pitch, yaw = quat_to_euler_wxyz(quat)
     goal_dist = torch.norm(env._goal_pos[env_id] - env._robot.data.root_pos_w[env_id]).item()
     goal_z_virtual = goal[2].item() - args.z_reference_offset
     pos_z_virtual = pos[2].item() - args.z_reference_offset
+    goal_local = goal - env_origin
+    pos_local = pos - env_origin
+    goal_local_z_virtual = goal_local[2].item() - args.z_reference_offset
+    pos_local_z_virtual = pos_local[2].item() - args.z_reference_offset
 
     writer.writerow([
         f"{elapsed_s:.4f}",
@@ -340,10 +353,18 @@ def append_env0_row(
         f"{goal[1].item():.6f}",
         f"{goal[2].item():.6f}",
         f"{goal_z_virtual:.6f}",
+        f"{goal_local[0].item():.6f}",
+        f"{goal_local[1].item():.6f}",
+        f"{goal_local[2].item():.6f}",
+        f"{goal_local_z_virtual:.6f}",
         f"{pos[0].item():.6f}",
         f"{pos[1].item():.6f}",
         f"{pos[2].item():.6f}",
         f"{pos_z_virtual:.6f}",
+        f"{pos_local[0].item():.6f}",
+        f"{pos_local[1].item():.6f}",
+        f"{pos_local[2].item():.6f}",
+        f"{pos_local_z_virtual:.6f}",
         f"{vel[0].item():.6f}",
         f"{vel[1].item():.6f}",
         f"{vel[2].item():.6f}",

@@ -32,6 +32,7 @@ import csv
 import math
 import os
 import sys
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -71,6 +72,18 @@ COMPARE_SIGNALS = [
     ("motor.m2", "Motor M2", "PWM"),
     ("motor.m3", "Motor M3", "PWM"),
     ("motor.m4", "Motor M4", "PWM"),
+    # Motor RPMs where available
+    ("motor.rpm.m1", "Motor RPM M1", "rpm"),
+    ("motor.rpm.m2", "Motor RPM M2", "rpm"),
+    ("motor.rpm.m3", "Motor RPM M3", "rpm"),
+    ("motor.rpm.m4", "Motor RPM M4", "rpm"),
+    # IMU-style duplicate channels where available
+    ("imu.acc_x", "IMU Accel X", "g"),
+    ("imu.acc_y", "IMU Accel Y", "g"),
+    ("imu.acc_z", "IMU Accel Z", "g"),
+    ("imu.gyro_x", "IMU Gyro X", "deg/s"),
+    ("imu.gyro_y", "IMU Gyro Y", "deg/s"),
+    ("imu.gyro_z", "IMU Gyro Z", "deg/s"),
 ]
 
 # Signals for tracking-error analysis (need target columns present)
@@ -96,6 +109,169 @@ def load_csv(path: str) -> Dict[str, np.ndarray]:
                 except (ValueError, TypeError):
                     data[key].append(float("nan"))
     return {k: np.array(v) for k, v in data.items()}
+
+
+def _copy_if_present(dst: Dict[str, np.ndarray], src: Dict[str, np.ndarray], src_key: str, dst_key: str):
+    if src_key in src and dst_key not in dst:
+        dst[dst_key] = src[src_key].copy()
+
+
+def normalize_sim_csv(raw: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    """Normalize sim CSVs from eval_pointnav_goal.py or flight_eval_utils.py."""
+    data = dict(raw)
+
+    if "t" not in data and "time_s" in data:
+        data["t"] = data["time_s"].copy()
+
+    _copy_if_present(data, raw, "pos_local_x", "stateEstimate.x")
+    _copy_if_present(data, raw, "pos_local_y", "stateEstimate.y")
+    _copy_if_present(data, raw, "pos_local_z_virtual", "stateEstimate.z")
+    _copy_if_present(data, raw, "pos_x", "stateEstimate.x")
+    _copy_if_present(data, raw, "pos_y", "stateEstimate.y")
+    _copy_if_present(data, raw, "pos_z_virtual", "stateEstimate.z")
+    if "stateEstimate.z" not in data:
+        _copy_if_present(data, raw, "pos_z", "stateEstimate.z")
+
+    _copy_if_present(data, raw, "vel_x", "velocity.x")
+    _copy_if_present(data, raw, "vel_y", "velocity.y")
+    _copy_if_present(data, raw, "vel_z", "velocity.z")
+
+    _copy_if_present(data, raw, "roll_deg", "stabilizer.roll")
+    _copy_if_present(data, raw, "pitch_deg", "stabilizer.pitch")
+    _copy_if_present(data, raw, "yaw_deg", "stabilizer.yaw")
+    _copy_if_present(data, raw, "ang_vel_x", "gyro.x")
+    _copy_if_present(data, raw, "ang_vel_y", "gyro.y")
+    _copy_if_present(data, raw, "ang_vel_z", "gyro.z")
+
+    _copy_if_present(data, raw, "goal_local_x", "target.x")
+    _copy_if_present(data, raw, "goal_local_y", "target.y")
+    _copy_if_present(data, raw, "goal_local_z_virtual", "target.z")
+    _copy_if_present(data, raw, "goal_x", "target.x")
+    _copy_if_present(data, raw, "goal_y", "target.y")
+    _copy_if_present(data, raw, "goal_z_virtual", "target.z")
+    if "target.z" not in data:
+        _copy_if_present(data, raw, "goal_z", "target.z")
+
+    _copy_if_present(data, raw, "action_m1", "action.m1")
+    _copy_if_present(data, raw, "action_m2", "action.m2")
+    _copy_if_present(data, raw, "action_m3", "action.m3")
+    _copy_if_present(data, raw, "action_m4", "action.m4")
+
+    if all(k in data for k in ("t", "velocity.x", "velocity.y", "velocity.z")) and "acc.x" not in data:
+        t = data["t"]
+        vx, vy, vz = data["velocity.x"], data["velocity.y"], data["velocity.z"]
+        ax = np.full_like(vx, np.nan, dtype=float)
+        ay = np.full_like(vy, np.nan, dtype=float)
+        az = np.full_like(vz, np.nan, dtype=float)
+        if len(t) > 1:
+            dt = np.diff(t)
+            valid = np.abs(dt) > 1e-12
+            ax[1:][valid] = np.diff(vx)[valid] / dt[valid] / 9.81
+            ay[1:][valid] = np.diff(vy)[valid] / dt[valid] / 9.81
+            az[1:][valid] = np.diff(vz)[valid] / dt[valid] / 9.81
+        data["acc.x"] = ax
+        data["acc.y"] = ay
+        data["acc.z"] = az
+
+    _copy_if_present(data, data, "acc.x", "imu.acc_x")
+    _copy_if_present(data, data, "acc.y", "imu.acc_y")
+    _copy_if_present(data, data, "acc.z", "imu.acc_z")
+    _copy_if_present(data, data, "gyro.x", "imu.gyro_x")
+    _copy_if_present(data, data, "gyro.y", "imu.gyro_y")
+    _copy_if_present(data, data, "gyro.z", "imu.gyro_z")
+
+    if all(k in data for k in ("action.m1", "action.m2", "action.m3", "action.m4")) and "motor.m1" not in data:
+        for idx in range(1, 5):
+            data[f"motor.m{idx}"] = np.clip((data[f"action.m{idx}"] + 1.0) * 0.5 * 65535.0, 0.0, 65535.0)
+
+    if "target.yaw" not in data and "t" in data:
+        data["target.yaw"] = np.full_like(data["t"], np.nan, dtype=float)
+    if "pm.vbat" not in data and "t" in data:
+        data["pm.vbat"] = np.full_like(data["t"], np.nan, dtype=float)
+
+    return data
+
+
+def normalize_real_csv(raw: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    """Normalize real-flight CSVs into the shared namespace."""
+    data = dict(raw)
+    _copy_if_present(data, data, "acc.x", "imu.acc_x")
+    _copy_if_present(data, data, "acc.y", "imu.acc_y")
+    _copy_if_present(data, data, "acc.z", "imu.acc_z")
+    _copy_if_present(data, data, "gyro.x", "imu.gyro_x")
+    _copy_if_present(data, data, "gyro.y", "imu.gyro_y")
+    _copy_if_present(data, data, "gyro.z", "imu.gyro_z")
+    return data
+
+
+def resolve_output_dir(requested: Optional[str], sim_path: str) -> str:
+    """Resolve output directory, defaulting to a timestamped folder."""
+    if requested:
+        return requested
+
+    sim_dir = os.path.dirname(sim_path)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.join(sim_dir, f"sim2real_compare_{stamp}")
+
+
+def _resolve_target_height(data: Dict[str, np.ndarray], fallback: Optional[float]) -> Optional[float]:
+    """Resolve a target height from CSV columns or a fallback value."""
+    for key in ("target.z", "goal_z_virtual", "goal_z", "target_z"):
+        if key in data:
+            values = data[key]
+            finite = values[np.isfinite(values)]
+            if finite.size > 0:
+                return float(np.median(finite))
+    return fallback
+
+
+def trim_from_target_height_reach(
+    data: Dict[str, np.ndarray],
+    target_height: float,
+    tolerance: float,
+    label: str,
+) -> Dict[str, np.ndarray]:
+    """Trim a dataset so time starts at first upward reach of the target height."""
+    if "t" not in data or "stateEstimate.z" not in data:
+        print(f"WARNING: Cannot trim {label} on target height; missing t or stateEstimate.z.")
+        return data
+
+    t = data["t"]
+    z = data["stateEstimate.z"]
+    mask = np.isfinite(t) & np.isfinite(z)
+    if not np.any(mask):
+        print(f"WARNING: Cannot trim {label} on target height; no finite z samples.")
+        return data
+
+    valid_indices = np.nonzero(mask)[0]
+    z_valid = z[mask]
+
+    threshold = target_height - tolerance
+    above = z_valid >= threshold
+    if not np.any(above):
+        print(
+            f"WARNING: {label} never reaches target height {target_height:.3f}m "
+            f"within tolerance ±{tolerance:.3f}m."
+        )
+        return data
+
+    # Use the first upward crossing from below when possible so the start point
+    # reflects the actual reach event rather than an already-near initial state.
+    crossing_candidates = np.nonzero(above & np.concatenate(([True], ~above[:-1])))[0]
+    if crossing_candidates.size > 0:
+        reach_valid_idx = int(crossing_candidates[0])
+    else:
+        reach_valid_idx = int(np.nonzero(above)[0][0])
+
+    start_idx = int(valid_indices[reach_valid_idx])
+    t0 = float(t[start_idx])
+    trimmed = {key: values[start_idx:].copy() for key, values in data.items()}
+    trimmed["t"] = trimmed["t"] - t0
+    print(
+        f"Trimmed {label} to first target-height reach at t={t0:.3f}s "
+        f"(target={target_height:.3f}m, tol=±{tolerance:.3f}m)."
+    )
+    return trimmed
 
 
 # ── Time alignment ──────────────────────────────────────────────────────────
@@ -307,7 +483,8 @@ def main():
     parser = argparse.ArgumentParser(description="Sim-to-Real Flight Data Comparison")
     parser.add_argument("--sim", required=True, help="Path to simulation CSV (from play_eval.py)")
     parser.add_argument("--real", required=True, help="Path to real-world CSV (from WebUI)")
-    parser.add_argument("--output_dir", default=None, help="Directory for output plots/CSV")
+    parser.add_argument("--output_dir", default=None,
+                        help="Directory for output plots/CSV. If omitted, creates a timestamped folder next to the sim CSV.")
     parser.add_argument("--t_offset", type=float, default=0.0,
                         help="Time offset to add to real data (seconds). "
                              "Use this to manually align start times if needed.")
@@ -315,16 +492,24 @@ def main():
                         help="Auto-trim idle rows from real data where motors are zero (default: True)")
     parser.add_argument("--no_trim_idle", action="store_false", dest="trim_idle",
                         help="Disable auto-trim of idle rows")
+    parser.add_argument("--start_at_target_height", action="store_true", default=True,
+                        help="Trim both datasets to start at first target-height reach (default: True)")
+    parser.add_argument("--no_start_at_target_height", action="store_false", dest="start_at_target_height",
+                        help="Disable target-height reach trimming")
+    parser.add_argument("--target_height", type=float, default=None,
+                        help="Optional override for target height in meters")
+    parser.add_argument("--target_height_tolerance", type=float, default=0.0,
+                        help="Tolerance in meters for detecting target-height reach")
     parser.add_argument("--no_plot", action="store_true", help="Skip plot generation")
     args = parser.parse_args()
     
     # Load data
     print(f"Loading sim data:  {args.sim}")
-    sim_raw = load_csv(args.sim)
+    sim_raw = normalize_sim_csv(load_csv(args.sim))
     print(f"  → {len(sim_raw.get('t', []))} rows, columns: {list(sim_raw.keys())[:10]}...")
     
     print(f"Loading real data: {args.real}")
-    real_raw = load_csv(args.real)
+    real_raw = normalize_real_csv(load_csv(args.real))
     print(f"  → {len(real_raw.get('t', []))} rows, columns: {list(real_raw.keys())[:10]}...")
     
     if "t" not in sim_raw or "t" not in real_raw:
@@ -347,7 +532,25 @@ def main():
                   f"(removed {n_before - n_after} rows where motors=0)")
         else:
             print("\nWARNING: All motor values are zero — drone may not have been flying!")
-    
+
+    if args.start_at_target_height:
+        resolved_target_height = _resolve_target_height(real_raw, args.target_height)
+        if resolved_target_height is None:
+            resolved_target_height = _resolve_target_height(sim_raw, args.target_height)
+        if resolved_target_height is None:
+            print("\nWARNING: Could not resolve a target height; skipping target-height trimming.")
+        else:
+            print(
+                f"\nTarget-height trim enabled: target={resolved_target_height:.3f}m, "
+                f"tolerance=±{args.target_height_tolerance:.3f}m"
+            )
+            real_raw = trim_from_target_height_reach(
+                real_raw, resolved_target_height, args.target_height_tolerance, "real"
+            )
+            sim_raw = trim_from_target_height_reach(
+                sim_raw, resolved_target_height, args.target_height_tolerance, "sim"
+            )
+
     # Reset both time series to start at 0
     sim_raw["t"] = sim_raw["t"] - sim_raw["t"][0]
     real_raw["t"] = real_raw["t"] - real_raw["t"][0]
@@ -365,8 +568,9 @@ def main():
     print(f"  Common grid: {t_common[0]:.3f} – {t_common[-1]:.3f}s, {len(t_common)} samples")
     
     # Output directory
-    if args.output_dir:
-        os.makedirs(args.output_dir, exist_ok=True)
+    args.output_dir = resolve_output_dir(args.output_dir, args.sim)
+    os.makedirs(args.output_dir, exist_ok=True)
+    print(f"\nOutput directory: {os.path.abspath(args.output_dir)}")
     
     # Compute metrics for each signal
     print(f"\n{'='*90}")
@@ -449,7 +653,7 @@ def main():
             w.writeheader()
             w.writerows(metrics_rows)
         print(f"\nMetrics saved to: {metrics_csv}")
-    
+
     if args.output_dir:
         print(f"Plots saved to:   {args.output_dir}/")
     

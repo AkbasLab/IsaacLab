@@ -212,6 +212,7 @@ class FlightDataLogger:
         self.t0 = time.perf_counter()
         self.prev_vel = None
         self.prev_time = None
+        self.gravity = 9.81
         
     def reset(self):
         """Reset the logger for a new flight session."""
@@ -220,12 +221,14 @@ class FlightDataLogger:
         self.prev_vel = None
         self.prev_time = None
         
-    def log_step(self, env, env_idx: int = 0):
+    def log_step(self, env, env_idx: int = 0, target: Optional[tuple[float, float, float, float]] = None):
         """Log data for a single timestep.
         
         Args:
             env: The environment instance (must have _robot attribute)
             env_idx: Index of the environment to log (default: 0, first environment)
+            target: Optional target tuple (x, y, z, yaw_deg). If not provided,
+                tries to read env._goal_pos and uses NaN yaw.
         """
         current_time = time.perf_counter() - self.t0
         
@@ -242,6 +245,27 @@ class FlightDataLogger:
             acc = (vel - self.prev_vel) / dt if dt > 0 else np.zeros(3)
         else:
             acc = np.zeros(3)
+
+        # Convert world-frame acceleration estimate to g to match the real CSV.
+        acc_g = acc / self.gravity
+
+        if target is not None:
+            target_x, target_y, target_z, target_yaw = target
+        elif hasattr(env, "_goal_pos"):
+            goal = env._goal_pos[env_idx].cpu().numpy()
+            target_x, target_y, target_z = float(goal[0]), float(goal[1]), float(goal[2])
+            target_yaw = float("nan")
+        else:
+            target_x = target_y = target_z = target_yaw = float("nan")
+
+        if hasattr(env, "_rpm_state"):
+            rpm = env._rpm_state[env_idx].detach().cpu().numpy()
+        else:
+            rpm = np.full(4, np.nan, dtype=np.float32)
+
+        # Real Crazyflie logs motor.m* as PWM-like values in [0, 65535].
+        rpm_max = getattr(env, "_max_rpm", 21702.0)
+        pwm = rpm / rpm_max * 65535.0 if np.all(np.isfinite(rpm)) else np.full(4, np.nan, dtype=np.float32)
         
         # Store data in format matching real-world deployment
         self.log_data.append({
@@ -249,15 +273,37 @@ class FlightDataLogger:
             "stateEstimate.x": pos[0],
             "stateEstimate.y": pos[1],
             "stateEstimate.z": pos[2],
-            "acc.x": acc[0],
-            "acc.y": acc[1],
-            "acc.z": acc[2],
+            "acc.x": acc_g[0],
+            "acc.y": acc_g[1],
+            "acc.z": acc_g[2],
             "gyro.x": ang_vel[0] * 180.0 / np.pi,  # Convert to deg/s
             "gyro.y": ang_vel[1] * 180.0 / np.pi,
             "gyro.z": ang_vel[2] * 180.0 / np.pi,
             "stabilizer.roll": euler[0],
             "stabilizer.pitch": euler[1],
             "stabilizer.yaw": euler[2],
+            "target.x": target_x,
+            "target.y": target_y,
+            "target.z": target_z,
+            "target.yaw": target_yaw,
+            "pm.vbat": float("nan"),
+            "motor.m1": pwm[0],
+            "motor.m2": pwm[1],
+            "motor.m3": pwm[2],
+            "motor.m4": pwm[3],
+            "motor.rpm.m1": rpm[0],
+            "motor.rpm.m2": rpm[1],
+            "motor.rpm.m3": rpm[2],
+            "motor.rpm.m4": rpm[3],
+            "imu.acc_x": acc_g[0],
+            "imu.acc_y": acc_g[1],
+            "imu.acc_z": acc_g[2],
+            "imu.gyro_x": ang_vel[0] * 180.0 / np.pi,
+            "imu.gyro_y": ang_vel[1] * 180.0 / np.pi,
+            "imu.gyro_z": ang_vel[2] * 180.0 / np.pi,
+            "imu.mag_x": 0.0,
+            "imu.mag_y": 0.0,
+            "imu.mag_z": 0.0,
         })
         
         # Store for next acceleration computation
@@ -282,7 +328,14 @@ class FlightDataLogger:
             "stateEstimate.x", "stateEstimate.y", "stateEstimate.z",
             "acc.x", "acc.y", "acc.z",
             "gyro.x", "gyro.y", "gyro.z",
-            "stabilizer.roll", "stabilizer.pitch", "stabilizer.yaw"
+            "stabilizer.roll", "stabilizer.pitch", "stabilizer.yaw",
+            "target.x", "target.y", "target.z", "target.yaw",
+            "pm.vbat",
+            "motor.m1", "motor.m2", "motor.m3", "motor.m4",
+            "motor.rpm.m1", "motor.rpm.m2", "motor.rpm.m3", "motor.rpm.m4",
+            "imu.acc_x", "imu.acc_y", "imu.acc_z",
+            "imu.gyro_x", "imu.gyro_y", "imu.gyro_z",
+            "imu.mag_x", "imu.mag_y", "imu.mag_z",
         ]
         
         with open(filename, "w", newline="") as f:
