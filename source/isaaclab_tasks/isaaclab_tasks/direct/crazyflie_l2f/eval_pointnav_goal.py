@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Training-style point navigation evaluation for Crazyflie 2.1.
+Training-style Crazyflie evaluation for fixed-goal and trajectory tasks.
 
 This script intentionally avoids the legacy play_eval flow and instead reuses
 the same environment and actor classes as train_pointnav.py. It loads a .pt
@@ -13,6 +13,7 @@ Key properties:
 - Starts at the training init height for the provided goal_z
 - Keeps training-style reset/randomization unless explicitly overridden
 - Defaults to stochastic actions so the rollout behaves like training
+- Supports a separate trajectory-following mode driven by waypoint CSVs
 
 Examples:
     .\\isaaclab.bat -p source\\isaaclab_tasks\\isaaclab_tasks\\direct\\crazyflie_l2f\\eval_pointnav_goal.py --target_x 0.0 --target_y 0.0 --target_z 0.3 --headless
@@ -30,17 +31,26 @@ import os
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Sequence
 import torch
 
 from isaaclab.app import AppLauncher
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Training-style fixed-goal Crazyflie evaluation")
+    parser = argparse.ArgumentParser(description="Training-style Crazyflie evaluation")
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to .pt checkpoint")
+    parser.add_argument("--eval_mode", type=str, default="fixed_goal", choices=("fixed_goal", "trajectory"),
+                        help="Evaluation mode. 'fixed_goal' keeps the current hover/point-nav behavior. 'trajectory' follows a waypoint CSV by advancing goals online.")
     parser.add_argument("--target_x", type=float, required=True, help="Local-frame goal x in meters")
     parser.add_argument("--target_y", type=float, required=True, help="Local-frame goal y in meters")
     parser.add_argument("--target_z", type=float, required=True, help="Local-frame goal z in meters")
+    parser.add_argument("--waypoints_csv", type=str, default=None,
+                        help="Optional CSV with target.x/target.y/target.z columns. When provided, the eval advances to the next waypoint after env0 reaches the current one.")
+    parser.add_argument("--waypoint_reach_threshold", type=float, default=None,
+                        help="Optional waypoint reach threshold in meters. Defaults to env goal_reach_threshold.")
+    parser.add_argument("--waypoint_hold_steps", type=int, default=3,
+                        help="For trajectory mode, require env0 to stay inside the waypoint reach threshold for this many consecutive sim steps before advancing.")
     parser.add_argument("--z_reference_offset", type=float, default=0.0,
                         help="Virtual height offset in meters. Example: 1.0 means user z=0.3 is evaluated at world z=1.3")
     parser.add_argument("--num_envs", type=int, default=32, help="Number of parallel environments")
@@ -62,6 +72,29 @@ simulation_app = app_launcher.app
 from train_pointnav import CrazyfliePointNavEnvCfg, CrazyfliePointNavEnv, L2FActorNetwork  # noqa: E402
 from isaaclab.markers import VisualizationMarkers  # noqa: E402
 from isaaclab.markers.config import POSITION_GOAL_MARKER_CFG  # noqa: E402
+
+
+def is_trajectory_mode() -> bool:
+    return args.eval_mode == "trajectory"
+
+
+def effective_duration_s(waypoints_local: list[tuple[float, float, float]] | None = None) -> float:
+    duration_s = float(args.duration)
+    if is_trajectory_mode():
+        if waypoints_local is None:
+            waypoints_local = get_waypoints_local()
+        if waypoints_local:
+            # Use the denser real-flight path as the lower bound for trajectory runs.
+            duration_s = max(duration_s, 45.0)
+    return duration_s
+
+
+def effective_waypoint_threshold(env: CrazyfliePointNavEnv) -> float:
+    if args.waypoint_reach_threshold is not None:
+        return float(args.waypoint_reach_threshold)
+    if is_trajectory_mode():
+        return 0.03
+    return float(env.cfg.goal_reach_threshold)
 
 
 def quat_to_euler_wxyz(quat: torch.Tensor) -> tuple[float, float, float]:
@@ -100,24 +133,27 @@ def output_directory() -> Path:
     else:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         script_dir = Path(__file__).resolve().parent
-        out_dir = script_dir / "play_eval_results" / f"goal_eval_{stamp}"
+        run_prefix = "trajectory_eval" if is_trajectory_mode() else "goal_eval"
+        out_dir = script_dir / "play_eval_results" / f"{run_prefix}_{stamp}"
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir
 
 
 def build_env() -> CrazyfliePointNavEnv:
-    world_target_z = args.target_z + args.z_reference_offset
+    initial_goal_x, initial_goal_y, initial_goal_z = get_initial_goal_local()
+    world_target_z = initial_goal_z + args.z_reference_offset
+    duration_s = effective_duration_s()
     cfg = CrazyfliePointNavEnvCfg()
     cfg.scene.num_envs = args.num_envs
     cfg.debug_vis = False
-    cfg.episode_length_s = max(cfg.episode_length_s, args.duration)
+    cfg.episode_length_s = max(cfg.episode_length_s, duration_s)
 
     # Make the provided fixed goal look like a training-time task specification.
     cfg.goal_height = world_target_z
     cfg.init_target_height = world_target_z
     # Evaluation should record one continuous benchmark rollout, not a training
     # episode with resets from success or aggressive safety terminations.
-    cfg.goal_hold_steps = int(math.ceil(args.duration / cfg.sim.dt)) + 100
+    cfg.goal_hold_steps = int(math.ceil(duration_s / cfg.sim.dt)) + 100
     cfg.enable_disturbance = False
     cfg.init_guidance_probability = 1.0
     cfg.init_max_xy_offset = 0.0
@@ -137,17 +173,76 @@ def build_env() -> CrazyfliePointNavEnv:
     cfg.term_z_hard_max = max(args.target_z + 4.0, 5.0)
     cfg.term_tilt_soft_threshold = math.pi
     cfg.term_tilt_hard_threshold = math.pi + 0.1
-    cfg.term_tilt_persistence_steps = int(math.ceil(args.duration / cfg.sim.dt)) + 100
+    cfg.term_tilt_persistence_steps = int(math.ceil(duration_s / cfg.sim.dt)) + 100
     cfg.term_linear_velocity_soft_threshold = 100.0
     cfg.term_linear_velocity_hard_threshold = 200.0
-    cfg.term_linear_velocity_persistence_steps = int(math.ceil(args.duration / cfg.sim.dt)) + 100
+    cfg.term_linear_velocity_persistence_steps = int(math.ceil(duration_s / cfg.sim.dt)) + 100
     cfg.term_angular_velocity_soft_threshold = 1000.0
     cfg.term_angular_velocity_hard_threshold = 2000.0
-    cfg.term_angular_velocity_persistence_steps = int(math.ceil(args.duration / cfg.sim.dt)) + 100
+    cfg.term_angular_velocity_persistence_steps = int(math.ceil(duration_s / cfg.sim.dt)) + 100
 
     env = CrazyfliePointNavEnv(cfg)
-    env._eval_fixed_goal = (args.target_x, args.target_y, world_target_z)
+    env._eval_fixed_goal = (initial_goal_x, initial_goal_y, world_target_z)
     return env
+
+
+def load_waypoints_from_csv(csv_path: str) -> list[tuple[float, float, float]]:
+    """Load consecutive unique finite target waypoints from a real-flight CSV."""
+    waypoints: list[tuple[float, float, float]] = []
+    last_waypoint: tuple[float, float, float] | None = None
+
+    with Path(csv_path).open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        required = ("target.x", "target.y", "target.z")
+        missing = [name for name in required if name not in (reader.fieldnames or [])]
+        if missing:
+            raise ValueError(f"Waypoint CSV is missing required columns: {', '.join(missing)}")
+
+        for row in reader:
+            try:
+                x = float(row["target.x"])
+                y = float(row["target.y"])
+                z = float(row["target.z"])
+            except (TypeError, ValueError):
+                continue
+            if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+                continue
+            waypoint = (x, y, z)
+            if waypoint != last_waypoint:
+                waypoints.append(waypoint)
+                last_waypoint = waypoint
+
+    if not waypoints:
+        raise ValueError(f"No finite target waypoints found in {csv_path}")
+    return waypoints
+
+
+def get_waypoints_local() -> list[tuple[float, float, float]] | None:
+    if not args.waypoints_csv:
+        return None
+    return load_waypoints_from_csv(args.waypoints_csv)
+
+
+def get_initial_goal_local() -> tuple[float, float, float]:
+    waypoints = get_waypoints_local()
+    if waypoints:
+        return waypoints[0]
+    return (args.target_x, args.target_y, args.target_z)
+
+
+def set_eval_goal(env: CrazyfliePointNavEnv, goal_local: Sequence[float]):
+    """Overwrite the live world-frame goal for all environments."""
+    goal_tensor = torch.tensor(goal_local, dtype=env._goal_pos.dtype, device=env.device).unsqueeze(0)
+    goal_tensor[:, 2] += args.z_reference_offset
+    env._eval_fixed_goal = tuple(float(v) for v in goal_local)
+    env._goal_pos[:] = env._terrain.env_origins + goal_tensor
+
+    if hasattr(env, "_prev_dist_xy"):
+        env._prev_dist_xy[:] = env._goal_distance(env._robot.data.root_pos_w)
+    if hasattr(env, "_prev_speed"):
+        env._prev_speed[:] = torch.norm(env._robot.data.root_lin_vel_w[:, :2], dim=-1)
+    if hasattr(env, "_prev_height_below_target"):
+        env._prev_height_below_target[:] = torch.clamp(env._goal_pos[:, 2] - env._robot.data.root_pos_w[:, 2], min=0.0)
 
 
 def apply_ground_start(env: CrazyfliePointNavEnv):
@@ -187,13 +282,13 @@ def apply_ground_start(env: CrazyfliePointNavEnv):
     env.scene.update(env.cfg.sim.dt)
 
 
-def apply_goal_height_start(env: CrazyfliePointNavEnv):
+def apply_goal_height_start(env: CrazyfliePointNavEnv, start_z_local: float):
     """Place all drones at the commanded goal height with hover-ready state."""
     num_envs = env.num_envs
     device = env.device
 
     start_pos = env._terrain.env_origins.clone()
-    start_pos[:, 2] += args.target_z + args.z_reference_offset
+    start_pos[:, 2] += start_z_local + args.z_reference_offset
 
     quat = torch.zeros(num_envs, 4, device=device)
     quat[:, 0] = 1.0
@@ -278,11 +373,32 @@ def update_goal_marker(goal_marker: VisualizationMarkers | None, env: CrazyflieP
     goal_marker.visualize(translations=goal_pos, marker_indices=marker_indices)
 
 
+def update_view_camera(env: CrazyfliePointNavEnv):
+    """Place the viewport camera near env0 so the drone and current goal are both in frame."""
+    if args.headless:
+        return
+
+    drone_pos = env._robot.data.root_pos_w[0].detach().cpu()
+    goal_pos = env._goal_pos[0].detach().cpu()
+    focus = 0.6 * drone_pos + 0.4 * goal_pos
+
+    lateral_offset = torch.tensor([0.9, -1.1, 0.55], dtype=focus.dtype)
+    eye = focus + lateral_offset
+    target = focus + torch.tensor([0.0, 0.0, -0.05], dtype=focus.dtype)
+
+    env.sim.set_camera_view(
+        eye=tuple(float(v) for v in eye),
+        target=tuple(float(v) for v in target),
+    )
+
+
 def write_csv_header(writer: csv.writer):
     writer.writerow([
         "time_s",
         "env_id",
         "episode_step",
+        "waypoint_index",
+        "num_waypoints",
         "goal_x",
         "goal_y",
         "goal_z",
@@ -324,6 +440,8 @@ def append_env0_row(
     env: CrazyfliePointNavEnv,
     elapsed_s: float,
     episode_step: int,
+    waypoint_index: int,
+    num_waypoints: int,
     action: torch.Tensor,
     reward: torch.Tensor,
     terminated: torch.Tensor,
@@ -349,6 +467,8 @@ def append_env0_row(
         f"{elapsed_s:.4f}",
         env_id,
         episode_step,
+        waypoint_index,
+        num_waypoints,
         f"{goal[0].item():.6f}",
         f"{goal[1].item():.6f}",
         f"{goal[2].item():.6f}",
@@ -389,6 +509,10 @@ def main():
     if args.seed is not None:
         torch.manual_seed(args.seed)
 
+    waypoints_local = get_waypoints_local()
+    if is_trajectory_mode() and not waypoints_local:
+        raise ValueError("--eval_mode trajectory requires --waypoints_csv with target.x/target.y/target.z columns")
+
     env = build_env()
     checkpoint_path, actor, obs_mean, obs_std = load_actor(
         env.device, env.cfg.observation_space, env.cfg.action_space
@@ -397,16 +521,31 @@ def main():
     out_dir = output_directory()
     csv_path = out_dir / "goal_eval_data.csv"
     summary_path = out_dir / "summary.json"
+    waypoint_csv_path = str(Path(args.waypoints_csv).resolve()) if args.waypoints_csv else None
+    waypoint_index = 0
+    initial_goal_local = waypoints_local[0] if waypoints_local else (args.target_x, args.target_y, args.target_z)
+    duration_s = effective_duration_s(waypoints_local)
 
     print("\n" + "=" * 60)
-    print("TRAINING-STYLE FIXED-GOAL EVALUATION")
+    print("TRAINING-STYLE CRAZYFLIE EVALUATION")
     print("=" * 60)
     print(f"Checkpoint: {checkpoint_path}")
-    print(f"Goal (virtual frame): ({args.target_x:.2f}, {args.target_y:.2f}, {args.target_z:.2f}) m")
+    print(f"Mode: {'trajectory' if is_trajectory_mode() else 'fixed_goal'}")
+    if waypoints_local:
+        first_goal = waypoints_local[0]
+        print(f"Waypoint CSV: {waypoint_csv_path}")
+        print(f"Waypoints: {len(waypoints_local)}")
+        print(f"Initial goal (virtual frame): ({first_goal[0]:.2f}, {first_goal[1]:.2f}, {first_goal[2]:.2f}) m")
+    else:
+        print(f"Goal (virtual frame): ({args.target_x:.2f}, {args.target_y:.2f}, {args.target_z:.2f}) m")
     print(f"Z reference offset: {args.z_reference_offset:.2f} m")
-    print(f"Goal (world frame): ({args.target_x:.2f}, {args.target_y:.2f}, {args.target_z + args.z_reference_offset:.2f}) m")
+    if waypoints_local:
+        first_goal = waypoints_local[0]
+        print(f"Initial goal (world frame): ({first_goal[0]:.2f}, {first_goal[1]:.2f}, {first_goal[2] + args.z_reference_offset:.2f}) m")
+    else:
+        print(f"Goal (world frame): ({args.target_x:.2f}, {args.target_y:.2f}, {args.target_z + args.z_reference_offset:.2f}) m")
     print(f"Environments: {args.num_envs}")
-    print(f"Duration: {args.duration:.2f} s")
+    print(f"Duration: {duration_s:.2f} s")
     print(f"Policy mode: {'deterministic' if args.deterministic else 'stochastic'}")
     print(f"Start mode: {'ground' if args.ground_start else 'training-height'}")
     print(f"Goal marker: {'shown' if args.show_goal_marker and not args.headless else 'hidden'}")
@@ -414,22 +553,28 @@ def main():
     print("=" * 60 + "\n")
 
     obs_dict, _ = env.reset()
-    if abs(args.target_z) > 1e-6:
-        apply_goal_height_start(env)
+    if abs(initial_goal_local[2]) > 1e-6:
+        apply_goal_height_start(env, initial_goal_local[2])
         obs_dict = env._get_observations()
     elif args.ground_start:
         apply_ground_start(env)
+        obs_dict = env._get_observations()
+    if waypoints_local:
+        set_eval_goal(env, waypoints_local[waypoint_index])
         obs_dict = env._get_observations()
     clear_eval_runtime_state(env)
     obs = obs_dict["policy"]
 
     dt = env.cfg.sim.dt
-    num_steps = int(args.duration / dt)
-    goal_threshold = env.cfg.goal_reach_threshold
+    num_steps = int(duration_s / dt)
+    goal_threshold = effective_waypoint_threshold(env)
     goal_marker = create_goal_marker()
     update_goal_marker(goal_marker, env, goal_threshold)
+    update_view_camera(env)
     reached_once = torch.zeros(args.num_envs, dtype=torch.bool, device=env.device)
     first_reach_time = torch.full((args.num_envs,), float("nan"), device=env.device)
+    completed_waypoints = 0
+    waypoint_hold_counter = 0
     episode_step = 0
 
     with csv_path.open("w", newline="", encoding="utf-8") as f:
@@ -463,7 +608,18 @@ def main():
                 terminated[0] = False
                 truncated[0] = False
 
-            append_env0_row(writer, env, elapsed_s, episode_step, action, reward, terminated, truncated)
+            append_env0_row(
+                writer,
+                env,
+                elapsed_s,
+                episode_step,
+                waypoint_index,
+                len(waypoints_local) if waypoints_local else 1,
+                action,
+                reward,
+                terminated,
+                truncated,
+            )
 
             done = terminated | truncated
             if bool(done[0].item()):
@@ -471,6 +627,24 @@ def main():
                 break
             if done.any():
                 episode_step = 0
+
+            if waypoints_local:
+                if goal_dist[0].item() < goal_threshold:
+                    waypoint_hold_counter += 1
+                else:
+                    waypoint_hold_counter = 0
+
+                if waypoint_hold_counter >= max(1, args.waypoint_hold_steps):
+                    waypoint_hold_counter = 0
+                    if waypoint_index + 1 < len(waypoints_local):
+                        completed_waypoints = max(completed_waypoints, waypoint_index + 1)
+                        waypoint_index += 1
+                        set_eval_goal(env, waypoints_local[waypoint_index])
+                        obs = env._get_observations()["policy"]
+                        update_goal_marker(goal_marker, env, goal_threshold)
+                        update_view_camera(env)
+                    else:
+                        completed_waypoints = len(waypoints_local)
 
             if (step + 1) % 100 == 0:
                 reach_rate = reached_once.float().mean().item() * 100.0
@@ -480,25 +654,41 @@ def main():
                     f"time={elapsed_s:6.2f}s | "
                     f"env0_dist={env0_dist:6.3f}m | "
                     f"reached_once={reach_rate:5.1f}%"
+                    + (
+                        f" | waypoint={min(waypoint_index + 1, len(waypoints_local))}/{len(waypoints_local)}"
+                        if waypoints_local else ""
+                    )
                 )
 
     summary = {
         "checkpoint": checkpoint_path,
-        "goal_local": {
-            "x": args.target_x,
-            "y": args.target_y,
-            "z": args.target_z,
-        },
+        "eval_mode": args.eval_mode,
+        "goal_local": (
+            {
+                "x": args.target_x,
+                "y": args.target_y,
+                "z": args.target_z,
+            }
+            if not waypoints_local else None
+        ),
         "z_reference_offset_m": args.z_reference_offset,
-        "goal_world": {
-            "x": args.target_x,
-            "y": args.target_y,
-            "z": args.target_z + args.z_reference_offset,
-        },
+        "goal_world": (
+            {
+                "x": args.target_x,
+                "y": args.target_y,
+                "z": args.target_z + args.z_reference_offset,
+            }
+            if not waypoints_local else None
+        ),
+        "waypoint_csv": waypoint_csv_path,
+        "num_waypoints": len(waypoints_local) if waypoints_local else 0,
+        "completed_waypoints": completed_waypoints,
+        "final_waypoint_index": waypoint_index,
         "num_envs": args.num_envs,
-        "duration_s": args.duration,
+        "duration_s": duration_s,
         "deterministic": args.deterministic,
         "goal_threshold_m": goal_threshold,
+        "waypoint_hold_steps": args.waypoint_hold_steps if waypoints_local else 0,
         "reach_rate_percent": reached_once.float().mean().item() * 100.0,
         "mean_first_reach_time_s": (
             torch.nanmean(first_reach_time).item()

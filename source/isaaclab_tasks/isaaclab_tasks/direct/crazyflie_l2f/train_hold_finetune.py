@@ -40,9 +40,11 @@ tempfile.tempdir = LOCAL_TMP_DIR
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune pointnav checkpoint for fixed-position hold")
     parser.add_argument("--checkpoint", type=str, default=None, help="Warm-start checkpoint path")
+    parser.add_argument("--task_mode", type=str, default="mixed_nav_hold", choices=("precision_hold", "mixed_nav_hold"),
+                        help="Training task mode. 'precision_hold' preserves the tight hold specialization. 'mixed_nav_hold' broadens the same checkpoint into full 3D navigation plus indefinite hold.")
     parser.add_argument("--resume_best", action="store_true",
                         help="Warm-start from checkpoints_hold_finetune/best_model.pt by default")
-    parser.add_argument("--checkpoint_dir_name", type=str, default="checkpoints_hold_finetune_tight",
+    parser.add_argument("--checkpoint_dir_name", type=str, default="checkpoints_hold_finetune_unified",
                         help="Output checkpoint directory name under the script folder")
     parser.add_argument("--timestamp_checkpoint_dir", action="store_true",
                         help="Append a YYYYMMDD_HHMMSS suffix to the checkpoint directory name")
@@ -162,37 +164,75 @@ def build_env() -> CrazyfliePointNavEnv:
     cfg.init_target_height = world_target_z
     cfg.use_3d_goal_distance = True
 
-    # Precision-lock task: start near the target, but not exactly on it, and
-    # force the policy to stay inside a very tight 3D radius for a long time.
-    cfg.init_guidance_probability = 0.0
-    cfg.init_max_xy_offset = 0.12
-    cfg.init_max_angle = 0.05
-    cfg.init_max_linear_velocity = 0.05
-    cfg.init_max_angular_velocity = 0.05
-    cfg.init_height_offset_min = -0.03
-    cfg.init_height_offset_max = 0.03
+    if args.task_mode == "precision_hold":
+        # Precision-lock task: start near the target, but not exactly on it, and
+        # force the policy to stay inside a very tight 3D radius for a long time.
+        cfg.init_guidance_probability = 0.0
+        cfg.init_max_xy_offset = 0.12
+        cfg.init_max_angle = 0.05
+        cfg.init_max_linear_velocity = 0.05
+        cfg.init_max_angular_velocity = 0.05
+        cfg.init_height_offset_min = -0.03
+        cfg.init_height_offset_max = 0.03
+
+        # Reward shaping: touch matters a little, exact sustained hold matters a lot.
+        cfg.hover_gate_radius = max(0.08, args.goal_radius * 3.0)
+        cfg.hover_gate_min = 0.05
+        cfg.nav_progress_weight = 2.0
+        cfg.nav_reach_bonus = 10.0
+        cfg.nav_hold_step_weight = 8.0
+        cfg.nav_hold_bonus = 800.0
+        cfg.nav_braking_radius = max(0.10, args.goal_radius * 4.0)
+        cfg.hover_reward_scale = 0.4
+        cfg.hover_reward_constant = 0.8
+        cfg.hover_height_weight = 14.0
+        cfg.hover_orientation_weight = 24.0
+        cfg.hover_xy_velocity_weight = 2.0
+        cfg.hover_z_velocity_weight = 3.0
+        cfg.hover_angular_velocity_weight = 2.5
+        cfg.nav_height_track_weight = 2.5
+        cfg.nav_height_recovery_weight = 0.5
+        cfg.nav_speed_penalty_weight = 0.3
+        cfg.nav_speed_penalty_threshold = 1.5
+    else:
+        # Mixed navigation-and-hold task: most episodes require travel in XY/Z,
+        # some start near the goal, and the policy is still rewarded for
+        # settling and staying there once it arrives.
+        cfg.goal_reach_threshold = max(args.goal_radius, 0.06)
+        cfg.goal_min_distance = 0.15
+        cfg.goal_max_distance = 0.80
+        cfg.goal_height = args.goal_z_min + args.z_reference_offset
+        cfg.goal_height_min = args.goal_z_min + args.z_reference_offset
+        cfg.goal_height_max = args.goal_z_max + args.z_reference_offset
+        cfg.init_guidance_probability = 0.15
+        cfg.init_max_xy_offset = 0.20
+        cfg.init_max_angle = 0.10
+        cfg.init_max_linear_velocity = 0.10
+        cfg.init_max_angular_velocity = 0.10
+        cfg.init_height_offset_min = -0.10
+        cfg.init_height_offset_max = 0.10
+
+        cfg.hover_gate_radius = max(0.20, cfg.goal_reach_threshold * 4.0)
+        cfg.hover_gate_min = 0.15
+        cfg.nav_progress_weight = 5.0
+        cfg.nav_reach_bonus = 30.0
+        cfg.nav_hold_step_weight = 2.5
+        cfg.nav_hold_bonus = 250.0
+        cfg.nav_braking_radius = max(0.20, cfg.goal_reach_threshold * 5.0)
+        cfg.hover_reward_scale = 0.25
+        cfg.hover_reward_constant = 0.7
+        cfg.hover_height_weight = 8.0
+        cfg.hover_orientation_weight = 18.0
+        cfg.hover_xy_velocity_weight = 1.0
+        cfg.hover_z_velocity_weight = 1.5
+        cfg.hover_angular_velocity_weight = 1.5
+        cfg.nav_height_track_weight = 1.5
+        cfg.nav_height_recovery_weight = 0.8
+        cfg.nav_speed_penalty_weight = 0.15
+        cfg.nav_speed_penalty_threshold = 2.0
+
     cfg.init_target_height_min = spawn_height_min
     cfg.init_target_height_max = spawn_height_max
-
-    # Reward shaping: touch matters a little, exact sustained hold matters a lot.
-    cfg.hover_gate_radius = max(0.08, args.goal_radius * 3.0)
-    cfg.hover_gate_min = 0.05
-    cfg.nav_progress_weight = 2.0
-    cfg.nav_reach_bonus = 10.0
-    cfg.nav_hold_step_weight = 8.0
-    cfg.nav_hold_bonus = 800.0
-    cfg.nav_braking_radius = max(0.10, args.goal_radius * 4.0)
-    cfg.hover_reward_scale = 0.4
-    cfg.hover_reward_constant = 0.8
-    cfg.hover_height_weight = 14.0
-    cfg.hover_orientation_weight = 24.0
-    cfg.hover_xy_velocity_weight = 2.0
-    cfg.hover_z_velocity_weight = 3.0
-    cfg.hover_angular_velocity_weight = 2.5
-    cfg.nav_height_track_weight = 2.5
-    cfg.nav_height_recovery_weight = 0.5
-    cfg.nav_speed_penalty_weight = 0.3
-    cfg.nav_speed_penalty_threshold = 1.5
 
     # Keep training robust but slightly calmer than the original pointnav run.
     cfg.enable_disturbance = False
@@ -203,11 +243,12 @@ def build_env() -> CrazyfliePointNavEnv:
     else:
         # Random-goal specialization: preserve pointnav-style random goal
         # sampling while also varying goal height.
-        cfg.goal_min_distance = 0.2
-        cfg.goal_max_distance = 0.7
-        cfg.goal_height = args.goal_z_min + args.z_reference_offset
-        cfg.goal_height_min = args.goal_z_min + args.z_reference_offset
-        cfg.goal_height_max = args.goal_z_max + args.z_reference_offset
+        if args.task_mode == "precision_hold":
+            cfg.goal_min_distance = 0.2
+            cfg.goal_max_distance = 0.7
+            cfg.goal_height = args.goal_z_min + args.z_reference_offset
+            cfg.goal_height_min = args.goal_z_min + args.z_reference_offset
+            cfg.goal_height_max = args.goal_z_max + args.z_reference_offset
         fixed_goal = None
 
     env = CrazyfliePointNavEnv(cfg)
@@ -240,6 +281,7 @@ def train(env: CrazyfliePointNavEnv, agent: L2FPPOAgent):
     print(f"\n{'='*60}")
     print("HOLD FINE-TUNING")
     print(f"{'='*60}")
+    print(f"  Task mode:          {args.task_mode}")
     if use_fixed_goal:
         print(f"  Goal mode:          fixed")
         print(f"  Goal (virtual):     ({args.target_x:.2f}, {args.target_y:.2f}, {target_z:.2f}) m")
