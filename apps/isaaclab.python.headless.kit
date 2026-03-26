@@ -63,9 +63,11 @@ logSysStdOutput = false
 [settings]
 # MGPU is always on, you can turn it from the settings, and force this off to save even more resource if you
 # only want to use a single GPU on your MGPU system
-# False for Isaac Sim
-renderer.multiGpu.enabled = true
-renderer.multiGpu.autoEnable = true
+# Force single-GPU mode for headless runs. On mixed-GPU Windows systems
+# (for example NVIDIA dGPU + AMD iGPU), Isaac Sim can shut down during RL
+# rollout collection when the MGPU path is enabled.
+renderer.multiGpu.enabled = false
+renderer.multiGpu.autoEnable = false
 'rtx-transient'.resourcemanager.enableTextureStreaming = true
 app.asyncRendering = false
 app.asyncRenderingLowLatency = false

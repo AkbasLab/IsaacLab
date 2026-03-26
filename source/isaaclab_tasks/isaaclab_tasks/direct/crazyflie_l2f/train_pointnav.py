@@ -66,7 +66,10 @@ def parse_args():
     # Hyperparameters (tuned for quadrotor)
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
-    parser.add_argument("--batch_size", type=int, default=4096, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=4096, help="Mini-batch size for PPO updates")
+    parser.add_argument("--ppo_epochs", type=int, default=10, help="Number of PPO optimization epochs per rollout")
+    parser.add_argument("--entropy_coef", type=float, default=0.005, help="PPO entropy bonus coefficient")
+    parser.add_argument("--target_kl", type=float, default=0.03, help="Approximate KL threshold for early stopping PPO epochs")
     
     # AppLauncher adds its own args (including --headless)
     AppLauncher.add_app_launcher_args(parser)
@@ -267,12 +270,24 @@ class CrazyfliePointNavEnvCfg(DirectRLEnvCfg):
     nav_braking_radius = 0.3  # Start braking reward when within 30cm of goal
     nav_hold_step_weight = 0.5  # Per-step reward while inside goal radius and stabilizing
     nav_hold_bonus = 100.0  # Bonus when hold duration requirement is first satisfied
+    nav_segment_completion_bonus = 20.0  # Bounded completion bonus for chained motion tasks
     
     # Height control rewards
     # FIXED: height_recovery is now delta-based (reward for climbing, not for being low)
     nav_height_recovery_weight = 1.0  # Reward for reducing deficit (climbing back up)
     nav_height_descent_weight = 1.0  # Reward for reducing excess height (descending down)
     nav_height_track_weight = 0.5  # Gaussian reward for staying near target height
+    nav_path_progress_weight = 0.0  # Reward for forward progress along the active path segment
+    nav_path_deviation_weight = 0.0  # Reward for staying close to the active path segment
+    nav_overshoot_penalty_weight = 0.0  # Penalize projecting far past the active segment goal
+    nav_oscillation_penalty_weight = 0.0  # Penalize repeated sign flips around the active goal
+    nav_corner_speed_penalty_weight = 0.0  # Penalize entering sharp corners with too much speed
+    nav_corner_speed_threshold = 1.3  # XY/3D speed threshold for turn entry penalty
+    nav_goal_speed_penalty_radius = 0.25  # Apply stronger approach-speed shaping near the goal
+    nav_goal_closing_speed_penalty_weight = 0.0  # Penalize charging at the goal too fast
+    nav_goal_closing_speed_threshold = 0.55  # Allowed closing speed near the goal
+    nav_goal_vertical_speed_penalty_weight = 0.0  # Penalize excessive z-speed near the goal
+    nav_goal_vertical_speed_threshold = 0.28  # Allowed vertical speed magnitude near the goal
     
     # Speed penalty: penalize going too fast (above soft linvel threshold)
     # Uses XY speed only - don't punish vertical corrections
@@ -500,12 +515,21 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         self._prev_height_below_target = torch.zeros(self.num_envs, device=self.device)
         # Previous height excess (for symmetric descent reward when above target)
         self._prev_height_above_target = torch.zeros(self.num_envs, device=self.device)
+        # Active path segment state for soft line-following shaping.
+        self._path_start_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        self._path_goal_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        self._prev_path_progress = torch.zeros(self.num_envs, device=self.device)
+        self._prev_goal_axis_sign = torch.zeros(self.num_envs, device=self.device)
+        self._latest_path_deviation = torch.zeros(self.num_envs, device=self.device)
+        self._latest_overshoot = torch.zeros(self.num_envs, device=self.device)
+        self._latest_corner_speed = torch.zeros(self.num_envs, device=self.device)
         
         # Track if goal was reached this episode
         self._goal_reached = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         # Track sustained hold inside goal radius
         self._goal_hold_counter = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
         self._goal_held = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._goal_hold_steps = torch.full((self.num_envs,), self.cfg.goal_hold_steps, dtype=torch.int32, device=self.device)
         
         # Episode statistics
         self._episode_sums = {
@@ -522,7 +546,15 @@ class CrazyfliePointNavEnv(DirectRLEnv):
             "hold_step_reward": torch.zeros(self.num_envs, device=self.device),
             "hold_bonus": torch.zeros(self.num_envs, device=self.device),
             "speed_penalty": torch.zeros(self.num_envs, device=self.device),
+            "goal_closing_speed_penalty": torch.zeros(self.num_envs, device=self.device),
+            "goal_vertical_speed_penalty": torch.zeros(self.num_envs, device=self.device),
             "height_descent_reward": torch.zeros(self.num_envs, device=self.device),
+            "path_progress_reward": torch.zeros(self.num_envs, device=self.device),
+            "path_deviation_reward": torch.zeros(self.num_envs, device=self.device),
+            "segment_completion_bonus": torch.zeros(self.num_envs, device=self.device),
+            "overshoot_penalty": torch.zeros(self.num_envs, device=self.device),
+            "oscillation_penalty": torch.zeros(self.num_envs, device=self.device),
+            "corner_speed_penalty": torch.zeros(self.num_envs, device=self.device),
             "reach_bonus": torch.zeros(self.num_envs, device=self.device),
             "total_reward": torch.zeros(self.num_envs, device=self.device),
             "goal_reached": torch.zeros(self.num_envs, device=self.device),
@@ -642,7 +674,7 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         print(f"  Physics dt:        {self._dt*1000:.1f} ms ({1/self._dt:.0f} Hz)")
         print(f"  Episode length:    {self.cfg.episode_length_s:.1f} s")
         print(f"  Num envs:          {self.num_envs}")
-        print(f"  Observation dim:   {self.cfg.observation_space} (146 hover + 3 goal)")
+        print(f"  Observation dim:   {self.cfg.observation_space} (export-compatible 146 state/history + 3 goal)")
         print(f"  Action dim:        {self.cfg.action_space}")
         print(f"  Mass:              {self._mass*1000:.1f} g")
         print(f"  Hover RPM:         {self._hover_rpm:.0f}")
@@ -948,6 +980,7 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         
         # Progress reward: decrease in configured goal distance (XY or 3D).
         dist_to_goal = self._goal_distance(pos_w)
+        goal_vec = self._goal_pos - pos_w
         
         # Gate hover reward by distance to goal
         # Far from goal: hover_reward * 0.2 (can't farm stability reward)
@@ -973,8 +1006,9 @@ class CrazyfliePointNavEnv(DirectRLEnv):
             self._goal_hold_counter + 1,
             torch.zeros_like(self._goal_hold_counter)
         )
-        newly_held = (self._goal_hold_counter >= cfg.goal_hold_steps) & (~self._goal_held)
-        self._goal_held = self._goal_held | (self._goal_hold_counter >= cfg.goal_hold_steps)
+        required_hold_steps = self._goal_hold_steps.to(self._goal_hold_counter.dtype)
+        newly_held = (self._goal_hold_counter >= required_hold_steps) & (~self._goal_held)
+        self._goal_held = self._goal_held | (self._goal_hold_counter >= required_hold_steps)
 
         # Hold rewards: encourage staying settled at the goal, not only touching it.
         hold_step_reward = cfg.nav_hold_step_weight * in_goal.float() * (hover_reward + 1.0)
@@ -1014,11 +1048,79 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         # Update previous height deficits/excesses
         self._prev_height_below_target = height_below.clone()
         self._prev_height_above_target = height_above.clone()
+
+        # Path shaping over the current segment from path start -> active goal.
+        segment_vec = self._path_goal_pos - self._path_start_pos
+        segment_len = torch.norm(segment_vec, dim=-1)
+        safe_len = torch.clamp(segment_len, min=1e-4)
+        segment_dir = segment_vec / safe_len.unsqueeze(-1)
+        rel_pos = pos_w - self._path_start_pos
+        raw_path_progress = (rel_pos * segment_dir).sum(dim=-1)
+        path_progress = torch.clamp(raw_path_progress, min=0.0)
+        path_progress = torch.minimum(path_progress, safe_len)
+        proj_point = self._path_start_pos + segment_dir * path_progress.unsqueeze(-1)
+        path_deviation = torch.norm(pos_w - proj_point, dim=-1)
+        path_progress_delta = path_progress - self._prev_path_progress
+        continue_on_goal_mask = getattr(self, "_continue_on_goal_mask", None)
+        braking_radius_safe = max(float(cfg.nav_braking_radius), 1e-4)
+        if continue_on_goal_mask is not None:
+            path_gate = torch.where(
+                continue_on_goal_mask,
+                torch.ones_like(dist_to_goal),
+                torch.clamp(dist_to_goal / braking_radius_safe, 0.0, 1.0),
+            )
+        else:
+            path_gate = torch.clamp(dist_to_goal / braking_radius_safe, 0.0, 1.0)
+        path_progress_reward = cfg.nav_path_progress_weight * torch.clamp(path_progress_delta, -0.5, 0.5) * path_gate
+        path_deviation_reward = cfg.nav_path_deviation_weight * torch.exp(-8.0 * path_deviation ** 2) * path_gate
+        self._prev_path_progress = path_progress.clone()
+        self._latest_path_deviation = path_deviation.clone()
+
+        axis_remaining = safe_len - raw_path_progress
+        axis_sign = torch.sign(axis_remaining)
+        oscillation_flip = (self._prev_goal_axis_sign * axis_sign < 0) & (torch.abs(axis_remaining) < cfg.nav_braking_radius * 1.5)
+        oscillation_penalty = -cfg.nav_oscillation_penalty_weight * oscillation_flip.float()
+        self._prev_goal_axis_sign = torch.where(torch.abs(axis_remaining) > 1e-4, axis_sign, self._prev_goal_axis_sign)
+
+        overshoot = torch.relu(raw_path_progress - safe_len)
+        overshoot_penalty = -cfg.nav_overshoot_penalty_weight * overshoot * (1.0 + speed_now)
+        self._latest_overshoot = overshoot.clone()
+
+        corner_speed_penalty = torch.zeros_like(speed_now)
+        if continue_on_goal_mask is not None:
+            near_transition = continue_on_goal_mask & near_goal
+            corner_speed_excess = torch.relu(speed_now - cfg.nav_corner_speed_threshold)
+            corner_speed_penalty = -cfg.nav_corner_speed_penalty_weight * corner_speed_excess * near_transition.float()
+            self._latest_corner_speed = torch.where(near_transition, speed_now, torch.zeros_like(speed_now))
+        else:
+            self._latest_corner_speed = torch.zeros_like(speed_now)
+
+        segment_completion_bonus = torch.zeros_like(dist_to_goal)
+        if continue_on_goal_mask is not None:
+            segment_completion_bonus = just_reached.float() * continue_on_goal_mask.float() * cfg.nav_segment_completion_bonus
         
         # Speed penalty: penalize going too fast horizontally (XY speed only)
         # Don't punish vertical corrections
         speed_excess = torch.relu(speed_now - cfg.nav_speed_penalty_threshold)
         speed_penalty = -cfg.nav_speed_penalty_weight * speed_excess ** 2
+
+        # Near the goal, punish excessive closing speed and z-speed so the
+        # policy learns to enter the goal sphere under control instead of
+        # blasting through and trying to recover afterward.
+        goal_speed_radius = max(float(cfg.nav_goal_speed_penalty_radius), 1e-4)
+        goal_speed_gate = torch.clamp(1.0 - (dist_to_goal / goal_speed_radius), 0.0, 1.0)
+        if cfg.use_3d_goal_distance:
+            goal_dir = goal_vec / torch.clamp(dist_to_goal.unsqueeze(-1), min=1e-4)
+            closing_speed = (lin_vel * goal_dir).sum(dim=-1)
+        else:
+            goal_vec_xy = goal_vec[:, :2]
+            goal_dir_xy = goal_vec_xy / torch.clamp(torch.norm(goal_vec_xy, dim=-1, keepdim=True), min=1e-4)
+            closing_speed = (lin_vel[:, :2] * goal_dir_xy).sum(dim=-1)
+        closing_speed_excess = torch.relu(closing_speed - cfg.nav_goal_closing_speed_threshold)
+        goal_closing_speed_penalty = -cfg.nav_goal_closing_speed_penalty_weight * goal_speed_gate * (closing_speed_excess ** 2)
+
+        vertical_speed_excess = torch.relu(torch.abs(lin_vel[:, 2]) - cfg.nav_goal_vertical_speed_threshold)
+        goal_vertical_speed_penalty = -cfg.nav_goal_vertical_speed_penalty_weight * goal_speed_gate * (vertical_speed_excess ** 2)
         
         # Low-height penalty: asymmetric quadratic penalty for being below floor
         # Makes low-altitude farming unprofitable without changing termination
@@ -1033,7 +1135,10 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         reward = (
             hover_reward + progress_reward + braking_reward + hold_step_reward + hold_bonus +
             height_tracking_reward + height_recovery_reward + height_descent_reward +
-            speed_penalty + low_height_penalty +
+            path_progress_reward + path_deviation_reward +
+            segment_completion_bonus + overshoot_penalty + oscillation_penalty +
+            corner_speed_penalty + speed_penalty + goal_closing_speed_penalty +
+            goal_vertical_speed_penalty + low_height_penalty +
             reach_bonus
         )
         
@@ -1051,7 +1156,15 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         self._episode_sums["hold_step_reward"] += hold_step_reward
         self._episode_sums["hold_bonus"] += hold_bonus
         self._episode_sums["height_descent_reward"] += height_descent_reward
+        self._episode_sums["path_progress_reward"] += path_progress_reward
+        self._episode_sums["path_deviation_reward"] += path_deviation_reward
+        self._episode_sums["segment_completion_bonus"] += segment_completion_bonus
+        self._episode_sums["overshoot_penalty"] += overshoot_penalty
+        self._episode_sums["oscillation_penalty"] += oscillation_penalty
+        self._episode_sums["corner_speed_penalty"] += corner_speed_penalty
         self._episode_sums["speed_penalty"] += speed_penalty
+        self._episode_sums["goal_closing_speed_penalty"] += goal_closing_speed_penalty
+        self._episode_sums["goal_vertical_speed_penalty"] += goal_vertical_speed_penalty
         self._episode_sums["reach_bonus"] += reach_bonus
         self._episode_sums["total_reward"] += reward
         self._episode_sums["goal_reached"] += just_reached.float()
@@ -1203,7 +1316,10 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         safety_terminated = xy_exceeded | too_low | too_high | too_tilted | lin_vel_exceeded | ang_vel_exceeded
         
         # Goal hold termination (success after sustained hold)
-        goal_terminated = self._goal_held
+        goal_terminated = self._goal_held.clone()
+        continue_on_goal_mask = getattr(self, "_continue_on_goal_mask", None)
+        if continue_on_goal_mask is not None:
+            goal_terminated = goal_terminated & (~continue_on_goal_mask)
         
         terminated = safety_terminated | goal_terminated
         
@@ -1323,6 +1439,7 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         self._goal_reached[env_ids] = False
         self._goal_hold_counter[env_ids] = 0
         self._goal_held[env_ids] = False
+        self._goal_hold_steps[env_ids] = cfg.goal_hold_steps
         
         # Guidance: spawn perfectly at target with some probability
         guidance_mask = torch.rand(n, device=self.device) < cfg.init_guidance_probability
@@ -1400,6 +1517,17 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         # Initialize previous height deficit from the true goal height.
         self._prev_height_below_target[env_ids] = torch.clamp(self._goal_pos[env_ids, 2] - pos[:, 2], min=0.0)
         self._prev_height_above_target[env_ids] = torch.clamp(pos[:, 2] - self._goal_pos[env_ids, 2], min=0.0)
+        self._path_start_pos[env_ids] = pos.clone()
+        self._path_goal_pos[env_ids] = self._goal_pos[env_ids].clone()
+        self._prev_path_progress[env_ids] = 0.0
+        segment_vec = self._path_goal_pos[env_ids] - self._path_start_pos[env_ids]
+        safe_len = torch.clamp(torch.norm(segment_vec, dim=-1), min=1e-4)
+        segment_dir = segment_vec / safe_len.unsqueeze(-1)
+        axis_remaining = safe_len - ((self._goal_pos[env_ids] - pos) * segment_dir).sum(dim=-1)
+        self._prev_goal_axis_sign[env_ids] = torch.sign(axis_remaining)
+        self._latest_path_deviation[env_ids] = 0.0
+        self._latest_overshoot[env_ids] = 0.0
+        self._latest_corner_speed[env_ids] = 0.0
         
         # Sample disturbances
         if cfg.enable_disturbance:
@@ -1636,6 +1764,8 @@ class L2FPPOAgent:
         entropy_coef: float = 0.005,
         value_coef: float = 0.5,
         max_grad_norm: float = 0.5,
+        mini_batch_size: int = 4096,
+        target_kl: float = 0.03,
     ):
         self.device = device
         self.gamma = gamma
@@ -1645,6 +1775,10 @@ class L2FPPOAgent:
         self.entropy_coef = entropy_coef
         self.value_coef = value_coef
         self.max_grad_norm = max_grad_norm
+        self.mini_batch_size = mini_batch_size
+        self.target_kl = target_kl
+        self.min_log_std: torch.Tensor | None = None
+        self.max_log_std: torch.Tensor | None = None
         
         self.actor = L2FActorNetwork(obs_dim, 64, action_dim).to(device)
         self.critic = L2FCriticNetwork(obs_dim, 64).to(device)
@@ -1656,6 +1790,32 @@ class L2FPPOAgent:
             list(self.actor.parameters()) + list(self.critic.parameters()),
             lr=lr
         )
+
+    def get_learning_rate(self) -> float:
+        return float(self.optimizer.param_groups[0]["lr"])
+
+    def set_learning_rate(self, lr: float):
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = lr
+
+    def set_log_std_bounds(self, min_log_std: torch.Tensor | float | None = None, max_log_std: torch.Tensor | float | None = None):
+        def _to_bound(value):
+            if value is None:
+                return None
+            if isinstance(value, torch.Tensor):
+                return value.detach().to(self.device).clone()
+            return torch.full_like(self.actor.log_std.data, float(value), device=self.device)
+
+        self.min_log_std = _to_bound(min_log_std)
+        self.max_log_std = _to_bound(max_log_std)
+        self.clamp_log_std()
+
+    def clamp_log_std(self):
+        with torch.no_grad():
+            if self.min_log_std is not None:
+                self.actor.log_std.data = torch.maximum(self.actor.log_std.data, self.min_log_std)
+            if self.max_log_std is not None:
+                self.actor.log_std.data = torch.minimum(self.actor.log_std.data, self.max_log_std)
     
     def normalize_obs(self, obs: torch.Tensor, update: bool = True) -> torch.Tensor:
         if not self.normalize_observations:
@@ -1682,43 +1842,89 @@ class L2FPPOAgent:
     
     def update(self, obs: torch.Tensor, actions: torch.Tensor,
                log_probs: torch.Tensor, returns: torch.Tensor, advantages: torch.Tensor):
-        obs = obs.detach()
-        actions = actions.detach()
-        log_probs = log_probs.detach()
-        returns = returns.detach()
-        advantages = advantages.detach()
+        # Keep the full rollout on CPU and only move mini-batches to the
+        # training device. This avoids large transient GPU allocations when
+        # the rollout buffer is flattened across many environments.
+        obs = obs.detach().cpu()
+        actions = actions.detach().cpu()
+        log_probs = log_probs.detach().cpu()
+        returns = returns.detach().cpu()
+        advantages = advantages.detach().cpu()
         
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        
-        obs_norm = self.normalize_obs(obs, update=False)
+        advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
         
         total_loss = 0.0
+        total_policy_loss = 0.0
+        total_value_loss = 0.0
+        total_entropy = 0.0
+        total_kl = 0.0
+        total_clipfrac = 0.0
+        num_updates = 0
+        batch_size = obs.shape[0]
+        mini_batch_size = max(1, min(self.mini_batch_size, batch_size))
+
         for _ in range(self.epochs):
-            mean = self.actor(obs_norm)
-            std = torch.exp(self.actor.log_std)
-            dist = torch.distributions.Normal(mean, std)
-            
-            new_log_probs = dist.log_prob(actions).sum(dim=-1)
-            entropy = dist.entropy().sum(dim=-1).mean()
-            
-            ratio = (new_log_probs - log_probs).exp()
-            clip_adv = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantages
-            policy_loss = -torch.min(ratio * advantages, clip_adv).mean()
-            
-            values = self.critic(obs_norm)
-            value_loss = ((values - returns) ** 2).mean()
-            
-            loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
-            
-            self.optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-            nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
-            self.optimizer.step()
-            
-            total_loss += loss.item()
+            permutation = torch.randperm(batch_size)
+            epoch_kl = 0.0
+            epoch_updates = 0
+            for start in range(0, batch_size, mini_batch_size):
+                batch_idx = permutation[start : start + mini_batch_size]
+                batch_obs = obs[batch_idx].to(self.device, non_blocking=True)
+                batch_obs = self.normalize_obs(batch_obs, update=False)
+                batch_actions = actions[batch_idx].to(self.device, non_blocking=True)
+                batch_log_probs = log_probs[batch_idx].to(self.device, non_blocking=True)
+                batch_returns = returns[batch_idx].to(self.device, non_blocking=True)
+                batch_advantages = advantages[batch_idx].to(self.device, non_blocking=True)
+
+                mean = self.actor(batch_obs)
+                std = torch.exp(self.actor.log_std)
+                dist = torch.distributions.Normal(mean, std)
+
+                new_log_probs = dist.log_prob(batch_actions).sum(dim=-1)
+                entropy = dist.entropy().sum(dim=-1).mean()
+
+                ratio = (new_log_probs - batch_log_probs).exp()
+                clip_adv = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * batch_advantages
+                policy_loss = -torch.min(ratio * batch_advantages, clip_adv).mean()
+
+                values = self.critic(batch_obs)
+                value_loss = ((values - batch_returns) ** 2).mean()
+
+                loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+                nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+                self.optimizer.step()
+                self.clamp_log_std()
+
+                approx_kl = (batch_log_probs - new_log_probs).mean().abs().item()
+                clipfrac = ((ratio - 1.0).abs() > self.clip_ratio).float().mean().item()
+
+                total_loss += loss.item()
+                total_policy_loss += policy_loss.item()
+                total_value_loss += value_loss.item()
+                total_entropy += entropy.item()
+                total_kl += approx_kl
+                total_clipfrac += clipfrac
+                num_updates += 1
+                epoch_kl += approx_kl
+                epoch_updates += 1
+
+            if self.target_kl > 0.0 and epoch_updates > 0 and epoch_kl / epoch_updates > self.target_kl:
+                break
         
-        return total_loss / self.epochs
+        denom = max(1, num_updates)
+        return {
+            "loss": total_loss / denom,
+            "policy_loss": total_policy_loss / denom,
+            "value_loss": total_value_loss / denom,
+            "entropy": total_entropy / denom,
+            "approx_kl": total_kl / denom,
+            "clipfrac": total_clipfrac / denom,
+            "num_updates": num_updates,
+        }
     
     def save(self, path: str, iteration: int, best_reward: float):
         torch.save({
@@ -1733,14 +1939,15 @@ class L2FPPOAgent:
             "obs_count": self.obs_normalizer.count,
         }, path)
     
-    def load(self, path: str):
+    def load(self, path: str, load_optimizer: bool = True, load_obs_stats: bool = True):
         checkpoint = torch.load(path, map_location=self.device)
         self.actor.load_state_dict(checkpoint["actor"])
         self.critic.load_state_dict(checkpoint["critic"])
         self.actor.log_std.data = checkpoint["log_std"]
-        if "optimizer" in checkpoint:
+        self.loaded_log_std = checkpoint["log_std"].to(self.device).clone()
+        if load_optimizer and "optimizer" in checkpoint:
             self.optimizer.load_state_dict(checkpoint["optimizer"])
-        if "obs_mean" in checkpoint:
+        if load_obs_stats and "obs_mean" in checkpoint:
             self.obs_normalizer.mean = checkpoint["obs_mean"].to(self.device)
             self.obs_normalizer.var = checkpoint["obs_var"].to(self.device)
             self.obs_normalizer.count = checkpoint["obs_count"]
@@ -1829,9 +2036,10 @@ def sanity_test(env: CrazyfliePointNavEnv, num_steps: int = 100):
     pos_error = obs[:, :3]
     assert (pos_error.abs() <= env.cfg.obs_position_clip + 0.01).all(), "Position error not clipped"
     
-    # Goal relative (last 3 dims) should be clipped
+    # Goal relative (last 3 dims) should remain the exported navigation suffix
     goal_rel = obs[:, -3:]
     assert (goal_rel.abs() <= env.cfg.obs_position_clip + 0.01).all(), "Goal relative not clipped"
+    assert obs[:, 18:146].shape[-1] == 128, "Action history block must remain 128 dims for export compatibility"
     
     print(f"  ✓ Observation components verified")
     
@@ -1912,10 +2120,10 @@ def train(env: CrazyfliePointNavEnv, agent: L2FPPOAgent, args):
 
             action, log_prob, value = agent.get_action_and_value(obs)
             
-            obs_buffer.append(obs)
-            action_buffer.append(action)
-            log_prob_buffer.append(log_prob)
-            value_buffer.append(value)
+            obs_buffer.append(obs.detach().cpu())
+            action_buffer.append(action.detach().cpu())
+            log_prob_buffer.append(log_prob.detach().cpu())
+            value_buffer.append(value.detach().cpu())
             
             obs_dict, reward, terminated, truncated, info = env.step(action)
             next_obs = obs_dict["policy"]
@@ -1926,8 +2134,8 @@ def train(env: CrazyfliePointNavEnv, agent: L2FPPOAgent, args):
             touch_events += (env._goal_reached & (~prev_goal_reached)).sum().item()
             hold_events += (env._goal_held & (~prev_goal_held)).sum().item()
             
-            reward_buffer.append(reward)
-            done_buffer.append(done)
+            reward_buffer.append(reward.detach().cpu())
+            done_buffer.append(done.detach().cpu())
             episode_rewards += reward
             
             # Count reaches
@@ -1947,7 +2155,7 @@ def train(env: CrazyfliePointNavEnv, agent: L2FPPOAgent, args):
         
         # Compute returns and advantages
         with torch.no_grad():
-            next_value = agent.get_value(obs)
+            next_value = agent.get_value(obs).detach().cpu()
         
         returns_t, advantages_t = compute_gae(
             rewards_t, values_t, dones_t, next_value,
@@ -1962,7 +2170,7 @@ def train(env: CrazyfliePointNavEnv, agent: L2FPPOAgent, args):
         advantages_flat = advantages_t.reshape(-1)
         
         # Update policy
-        loss = agent.update(obs_flat, actions_flat, log_probs_flat, returns_flat, advantages_flat)
+        update_stats = agent.update(obs_flat, actions_flat, log_probs_flat, returns_flat, advantages_flat)
         
         # Compute stats
         mean_reward = episode_rewards.mean().item() / steps_per_rollout
@@ -1992,7 +2200,8 @@ def train(env: CrazyfliePointNavEnv, agent: L2FPPOAgent, args):
             print(
                 f"[Iter {iteration:4d}] Reward: {mean_reward:8.3f} | "
                 f"HoldEvt/env: {hold_event_rate:5.3f} | TouchEvt/env: {touch_event_rate:5.3f} | "
-                f"EpHold: {reach_rate*100:5.1f}% | Std: {std:.3f} | Loss: {loss:.4f}{star}"
+                f"EpHold: {reach_rate*100:5.1f}% | Std: {std:.3f} | "
+                f"Loss: {update_stats['loss']:.4f} | KL: {update_stats['approx_kl']:.4f}{star}"
             )
         
         # Print comprehensive diagnostics every 50 iterations
@@ -2141,6 +2350,10 @@ def main():
         device=env.device,
         lr=args.lr,
         gamma=args.gamma,
+        epochs=args.ppo_epochs,
+        entropy_coef=args.entropy_coef,
+        mini_batch_size=args.batch_size,
+        target_kl=args.target_kl,
     )
     
     if args.play:
