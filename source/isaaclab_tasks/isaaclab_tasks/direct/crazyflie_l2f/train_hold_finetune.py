@@ -16,6 +16,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import csv
 import math
 import os
 import sys
@@ -40,8 +41,8 @@ tempfile.tempdir = LOCAL_TMP_DIR
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune pointnav checkpoint for fixed-position hold")
     parser.add_argument("--checkpoint", type=str, default=None, help="Warm-start checkpoint path")
-    parser.add_argument("--task_mode", type=str, default="mixed_nav_hold", choices=("precision_hold", "mixed_nav_hold"),
-                        help="Training task mode. 'precision_hold' preserves the tight hold specialization. 'mixed_nav_hold' broadens the same checkpoint into full 3D navigation plus indefinite hold.")
+    parser.add_argument("--task_mode", type=str, default="mixed_nav_hold", choices=("precision_hold", "mixed_nav_hold", "fast_nav_hold", "trajectory_track", "trajectory_generalized"),
+                        help="Training task mode. 'precision_hold' preserves tight hold specialization. 'mixed_nav_hold' broadens into full 3D navigation plus hold. 'fast_nav_hold' pushes harder on travel speed. 'trajectory_track' trains directly on a timed waypoint CSV. 'trajectory_generalized' mixes timed trajectory envs with random 3D navigation envs.")
     parser.add_argument("--resume_best", action="store_true",
                         help="Warm-start from checkpoints_hold_finetune/best_model.pt by default")
     parser.add_argument("--checkpoint_dir_name", type=str, default="checkpoints_hold_finetune_unified",
@@ -53,6 +54,16 @@ def parse_args():
     parser.add_argument("--target_z", type=float, default=None, help="Optional fixed goal z in meters")
     parser.add_argument("--goal_z_min", type=float, default=0.3, help="Minimum random goal z in meters")
     parser.add_argument("--goal_z_max", type=float, default=0.3, help="Maximum random goal z in meters")
+    parser.add_argument("--trajectory_csv", type=str, default=None,
+                        help="CSV with t,target.x,target.y,target.z columns for trajectory_track mode.")
+    parser.add_argument("--trajectory_skip_initial", type=int, default=0,
+                        help="Skip this many initial finite target rows from the trajectory CSV.")
+    parser.add_argument("--trajectory_min_spacing", type=float, default=0.0,
+                        help="Minimum 3D spacing in meters between kept trajectory targets.")
+    parser.add_argument("--trajectory_stride", type=int, default=1,
+                        help="Keep every Nth trajectory target after spacing.")
+    parser.add_argument("--trajectory_fraction", type=float, default=0.5,
+                        help="For trajectory_generalized, fraction of environments that use timed trajectory goals.")
     parser.add_argument("--spawn_z_min", type=float, default=0.0,
                         help="Minimum spawn z offset above the reference height in meters")
     parser.add_argument("--spawn_z_max", type=float, default=0.3,
@@ -145,12 +156,113 @@ def format_hold_tag(hold_time_s: float) -> str:
     return f"{hold_time_s:.1f}s".replace(".", "p")
 
 
+def load_timed_trajectory_from_csv(csv_path: str) -> list[tuple[float, float, float, float]]:
+    """Load a timed local-frame trajectory as (t_rel, x, y, z)."""
+    rows_out: list[tuple[float, float, float, float]] = []
+    with open(csv_path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        required = ("t", "target.x", "target.y", "target.z")
+        missing = [name for name in required if name not in (reader.fieldnames or [])]
+        if missing:
+            raise ValueError(f"Trajectory CSV missing columns: {', '.join(missing)}")
+
+        for row in reader:
+            try:
+                t = float(row["t"])
+                x = float(row["target.x"])
+                y = float(row["target.y"])
+                z = float(row["target.z"])
+            except (TypeError, ValueError):
+                continue
+            if not all(math.isfinite(v) for v in (t, x, y, z)):
+                continue
+            rows_out.append((t, x, y, z))
+
+    if args.trajectory_skip_initial > 0:
+        rows_out = rows_out[args.trajectory_skip_initial:]
+
+    if args.trajectory_min_spacing > 0.0:
+        spaced_rows: list[tuple[float, float, float, float]] = []
+        for row in rows_out:
+            if not spaced_rows:
+                spaced_rows.append(row)
+                continue
+            _, x, y, z = row
+            _, px, py, pz = spaced_rows[-1]
+            dist = math.sqrt((x - px) ** 2 + (y - py) ** 2 + (z - pz) ** 2)
+            if dist >= args.trajectory_min_spacing:
+                spaced_rows.append(row)
+        rows_out = spaced_rows
+
+    stride = max(1, args.trajectory_stride)
+    rows_out = rows_out[::stride]
+
+    if not rows_out:
+        raise ValueError(f"No finite trajectory targets found in {csv_path}")
+
+    t0 = rows_out[0][0]
+    return [(t - t0, x, y, z) for t, x, y, z in rows_out]
+
+
+def apply_timed_trajectory_goals(
+    env: CrazyfliePointNavEnv,
+    schedule_t: torch.Tensor,
+    schedule_xyz: torch.Tensor,
+    env_mask: torch.Tensor | None = None,
+):
+    """Update each environment's goal from the timed trajectory using its episode clock."""
+    if env_mask is None:
+        env_mask = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+    if not torch.any(env_mask):
+        return
+
+    env_ids = env_mask.nonzero(as_tuple=False).squeeze(-1)
+    episode_time = env.episode_length_buf[env_ids].to(torch.float32) * env.cfg.sim.dt
+    waypoint_idx = torch.searchsorted(schedule_t, episode_time, right=True) - 1
+    waypoint_idx = waypoint_idx.clamp(min=0, max=schedule_t.numel() - 1)
+
+    current_goals_local = schedule_xyz[waypoint_idx]
+    current_goals_world = env._terrain.env_origins[env_ids].clone()
+    current_goals_world[:, :2] += current_goals_local[:, :2]
+    current_goals_world[:, 2] = current_goals_local[:, 2] + args.z_reference_offset
+
+    target_changed = None
+    if hasattr(env, "_trajectory_last_idx"):
+        prev_idx = env._trajectory_last_idx[env_ids]
+        target_changed = waypoint_idx != prev_idx
+        env._trajectory_last_idx[env_ids] = waypoint_idx.clone()
+    else:
+        env._trajectory_last_idx = torch.full((env.num_envs,), -1, dtype=torch.long, device=env.device)
+        env._trajectory_last_idx[env_ids] = waypoint_idx.clone()
+        target_changed = torch.ones_like(waypoint_idx, dtype=torch.bool)
+
+    env._goal_pos[env_ids] = current_goals_world
+
+    if target_changed.any():
+        changed_env_ids = env_ids[target_changed]
+        pos_w = env._robot.data.root_pos_w
+        env._prev_dist_xy[changed_env_ids] = env._goal_distance(pos_w[changed_env_ids], changed_env_ids)
+        env._prev_height_below_target[changed_env_ids] = torch.clamp(
+            env._goal_pos[changed_env_ids, 2] - pos_w[changed_env_ids, 2],
+            min=0.0,
+        )
+        env._goal_reached[changed_env_ids] = False
+        env._goal_held[changed_env_ids] = False
+        env._goal_hold_counter[changed_env_ids] = 0
+
 def build_env() -> CrazyfliePointNavEnv:
     target_z = args.target_z if args.target_z is not None else args.goal_z_min
     world_target_z = target_z + args.z_reference_offset
     use_fixed_goal = args.target_x is not None and args.target_y is not None
     spawn_height_min = args.z_reference_offset + args.spawn_z_min
     spawn_height_max = args.z_reference_offset + args.spawn_z_max
+    uses_trajectory_schedule = args.task_mode in ("trajectory_track", "trajectory_generalized")
+    trajectory_schedule = load_timed_trajectory_from_csv(args.trajectory_csv) if uses_trajectory_schedule else None
+    if trajectory_schedule:
+        _, first_x, first_y, first_z = trajectory_schedule[0]
+        target_z = first_z
+        world_target_z = target_z + args.z_reference_offset
+        use_fixed_goal = False
 
     cfg = CrazyfliePointNavEnvCfg()
     cfg.scene.num_envs = args.num_envs
@@ -168,12 +280,12 @@ def build_env() -> CrazyfliePointNavEnv:
         # Precision-lock task: start near the target, but not exactly on it, and
         # force the policy to stay inside a very tight 3D radius for a long time.
         cfg.init_guidance_probability = 0.0
-        cfg.init_max_xy_offset = 0.12
-        cfg.init_max_angle = 0.05
-        cfg.init_max_linear_velocity = 0.05
-        cfg.init_max_angular_velocity = 0.05
-        cfg.init_height_offset_min = -0.03
-        cfg.init_height_offset_max = 0.03
+        cfg.init_max_xy_offset = 0.08
+        cfg.init_max_angle = 0.035
+        cfg.init_max_linear_velocity = 0.03
+        cfg.init_max_angular_velocity = 0.03
+        cfg.init_height_offset_min = -0.02
+        cfg.init_height_offset_max = 0.02
 
         # Reward shaping: touch matters a little, exact sustained hold matters a lot.
         cfg.hover_gate_radius = max(0.08, args.goal_radius * 3.0)
@@ -185,16 +297,17 @@ def build_env() -> CrazyfliePointNavEnv:
         cfg.nav_braking_radius = max(0.10, args.goal_radius * 4.0)
         cfg.hover_reward_scale = 0.4
         cfg.hover_reward_constant = 0.8
-        cfg.hover_height_weight = 14.0
-        cfg.hover_orientation_weight = 24.0
-        cfg.hover_xy_velocity_weight = 2.0
-        cfg.hover_z_velocity_weight = 3.0
-        cfg.hover_angular_velocity_weight = 2.5
-        cfg.nav_height_track_weight = 2.5
-        cfg.nav_height_recovery_weight = 0.5
-        cfg.nav_speed_penalty_weight = 0.3
-        cfg.nav_speed_penalty_threshold = 1.5
-    else:
+        cfg.hover_height_weight = 22.0
+        cfg.hover_orientation_weight = 28.0
+        cfg.hover_xy_velocity_weight = 3.0
+        cfg.hover_z_velocity_weight = 6.0
+        cfg.hover_angular_velocity_weight = 3.5
+        cfg.hover_action_rate_weight = 0.10
+        cfg.nav_height_track_weight = 4.0
+        cfg.nav_height_recovery_weight = 0.25
+        cfg.nav_speed_penalty_weight = 0.5
+        cfg.nav_speed_penalty_threshold = 1.0
+    elif args.task_mode == "mixed_nav_hold":
         # Mixed navigation-and-hold task: most episodes require travel in XY/Z,
         # some start near the goal, and the policy is still rewarded for
         # settling and staying there once it arrives.
@@ -221,15 +334,143 @@ def build_env() -> CrazyfliePointNavEnv:
         cfg.nav_braking_radius = max(0.20, cfg.goal_reach_threshold * 5.0)
         cfg.hover_reward_scale = 0.25
         cfg.hover_reward_constant = 0.7
-        cfg.hover_height_weight = 8.0
+        cfg.hover_height_weight = 10.0
         cfg.hover_orientation_weight = 18.0
         cfg.hover_xy_velocity_weight = 1.0
-        cfg.hover_z_velocity_weight = 1.5
+        cfg.hover_z_velocity_weight = 3.0
         cfg.hover_angular_velocity_weight = 1.5
-        cfg.nav_height_track_weight = 1.5
+        cfg.hover_action_rate_weight = 0.06
+        cfg.nav_height_track_weight = 2.5
         cfg.nav_height_recovery_weight = 0.8
         cfg.nav_speed_penalty_weight = 0.15
         cfg.nav_speed_penalty_threshold = 2.0
+    elif args.task_mode == "fast_nav_hold":
+        # Speed-focused navigation-and-hold task: bias the policy toward
+        # covering distance quickly while still requiring brief stable capture.
+        cfg.goal_reach_threshold = max(args.goal_radius, 0.05)
+        cfg.goal_min_distance = 0.20
+        cfg.goal_max_distance = 1.00
+        cfg.goal_height = args.goal_z_min + args.z_reference_offset
+        cfg.goal_height_min = args.goal_z_min + args.z_reference_offset
+        cfg.goal_height_max = args.goal_z_max + args.z_reference_offset
+        cfg.init_guidance_probability = 0.05
+        cfg.init_max_xy_offset = 0.25
+        cfg.init_max_angle = 0.12
+        cfg.init_max_linear_velocity = 0.12
+        cfg.init_max_angular_velocity = 0.12
+        cfg.init_height_offset_min = -0.12
+        cfg.init_height_offset_max = 0.12
+
+        # Require a shorter stable capture during the speed phase so the agent
+        # learns to transition aggressively without giving up control.
+        cfg.goal_hold_steps = max(1, int(round(min(args.hold_time, 3.0) / cfg.sim.dt)))
+
+        cfg.hover_gate_radius = max(0.30, cfg.goal_reach_threshold * 4.0)
+        cfg.hover_gate_min = 0.10
+        cfg.nav_progress_weight = 8.0
+        cfg.nav_reach_bonus = 40.0
+        cfg.nav_hold_step_weight = 1.5
+        cfg.nav_hold_bonus = 120.0
+        cfg.nav_braking_radius = max(0.18, cfg.goal_reach_threshold * 4.0)
+        cfg.hover_reward_scale = 0.20
+        cfg.hover_reward_constant = 0.6
+        cfg.hover_height_weight = 8.0
+        cfg.hover_orientation_weight = 14.0
+        cfg.hover_xy_velocity_weight = 0.6
+        cfg.hover_z_velocity_weight = 2.0
+        cfg.hover_angular_velocity_weight = 1.2
+        cfg.hover_action_rate_weight = 0.04
+        cfg.nav_height_track_weight = 1.5
+        cfg.nav_height_recovery_weight = 0.6
+        cfg.nav_speed_penalty_weight = 0.05
+        cfg.nav_speed_penalty_threshold = 3.0
+    elif args.task_mode == "trajectory_track":
+        # Timed trajectory tracking: follow a moving 3D reference on schedule.
+        if not args.trajectory_csv:
+            raise ValueError("--task_mode trajectory_track requires --trajectory_csv")
+
+        cfg.goal_reach_threshold = max(args.goal_radius, 0.10)
+        # The base env validates sampled-goal invariants at construction time,
+        # even though trajectory_track overrides the goal from the CSV on reset
+        # and before each policy step. Keep a small non-trivial placeholder
+        # range so initialization passes without affecting the live target path.
+        cfg.goal_min_distance = max(args.goal_radius + 0.02, 0.12)
+        cfg.goal_max_distance = cfg.goal_min_distance + 0.01
+        cfg.goal_height = world_target_z
+        cfg.goal_height_min = world_target_z
+        cfg.goal_height_max = world_target_z
+        cfg.init_guidance_probability = 0.0
+        cfg.init_max_xy_offset = 0.05
+        cfg.init_max_angle = 0.06
+        cfg.init_max_linear_velocity = 0.05
+        cfg.init_max_angular_velocity = 0.05
+        cfg.init_height_offset_min = -0.03
+        cfg.init_height_offset_max = 0.03
+
+        # Moving target: emphasize progress/tracking and smooth flight,
+        # de-emphasize "stop and hold forever at one point".
+        cfg.goal_hold_steps = max(1, int(round(min(args.hold_time, 0.3) / cfg.sim.dt)))
+        cfg.hover_gate_radius = max(0.25, cfg.goal_reach_threshold * 3.0)
+        cfg.hover_gate_min = 0.10
+        cfg.nav_progress_weight = 11.0
+        cfg.nav_reach_bonus = 6.0
+        cfg.nav_hold_step_weight = 0.35
+        cfg.nav_hold_bonus = 10.0
+        cfg.nav_braking_radius = max(0.18, cfg.goal_reach_threshold * 2.5)
+        cfg.hover_reward_scale = 0.28
+        cfg.hover_reward_constant = 0.5
+        cfg.hover_height_weight = 0.0
+        cfg.hover_orientation_weight = 18.0
+        cfg.hover_xy_velocity_weight = 0.7
+        cfg.hover_z_velocity_weight = 4.0
+        cfg.hover_angular_velocity_weight = 2.0
+        cfg.hover_action_rate_weight = 0.12
+        cfg.nav_height_track_weight = 0.0
+        cfg.nav_height_recovery_weight = 0.0
+        cfg.nav_speed_penalty_weight = 0.02
+        cfg.nav_speed_penalty_threshold = 4.0
+    else:
+        # Hybrid phase: keep broad random 3D navigation while dedicating a
+        # subset of envs to the timed trajectory schedule.
+        if not args.trajectory_csv:
+            raise ValueError("--task_mode trajectory_generalized requires --trajectory_csv")
+
+        cfg.goal_reach_threshold = max(args.goal_radius, 0.05)
+        cfg.goal_min_distance = 0.18
+        cfg.goal_max_distance = 0.90
+        cfg.goal_height = args.goal_z_min + args.z_reference_offset
+        cfg.goal_height_min = args.goal_z_min + args.z_reference_offset
+        cfg.goal_height_max = args.goal_z_max + args.z_reference_offset
+        cfg.init_guidance_probability = 0.10
+        cfg.init_max_xy_offset = 0.18
+        cfg.init_max_angle = 0.08
+        cfg.init_max_linear_velocity = 0.08
+        cfg.init_max_angular_velocity = 0.08
+        cfg.init_height_offset_min = -0.08
+        cfg.init_height_offset_max = 0.08
+
+        cfg.goal_hold_steps = max(1, int(round(min(args.hold_time, 1.0) / cfg.sim.dt)))
+        cfg.hover_gate_radius = max(0.22, cfg.goal_reach_threshold * 3.5)
+        cfg.hover_gate_min = 0.10
+        cfg.nav_progress_weight = 7.5
+        cfg.nav_reach_bonus = 18.0
+        cfg.nav_hold_step_weight = 1.0
+        cfg.nav_hold_bonus = 40.0
+        cfg.nav_braking_weight = 1.5
+        cfg.nav_braking_radius = max(0.24, cfg.goal_reach_threshold * 4.0)
+        cfg.hover_reward_scale = 0.26
+        cfg.hover_reward_constant = 0.55
+        cfg.hover_height_weight = 6.0
+        cfg.hover_orientation_weight = 18.0
+        cfg.hover_xy_velocity_weight = 1.2
+        cfg.hover_z_velocity_weight = 5.5
+        cfg.hover_angular_velocity_weight = 2.2
+        cfg.hover_action_rate_weight = 0.14
+        cfg.nav_height_track_weight = 1.5
+        cfg.nav_height_recovery_weight = 0.5
+        cfg.nav_height_descent_weight = 1.6
+        cfg.nav_speed_penalty_weight = 0.05
+        cfg.nav_speed_penalty_threshold = 2.8
 
     cfg.init_target_height_min = spawn_height_min
     cfg.init_target_height_max = spawn_height_max
@@ -257,6 +498,17 @@ def build_env() -> CrazyfliePointNavEnv:
     env._goal_height_max = args.goal_z_max + args.z_reference_offset
     env._spawn_height_min = spawn_height_min
     env._spawn_height_max = spawn_height_max
+    if trajectory_schedule:
+        env._trajectory_schedule_t = torch.tensor([row[0] for row in trajectory_schedule], dtype=torch.float32, device=env.device)
+        env._trajectory_schedule_xyz = torch.tensor([row[1:] for row in trajectory_schedule], dtype=torch.float32, device=env.device)
+        env._trajectory_last_idx = torch.full((env.num_envs,), -1, dtype=torch.long, device=env.device)
+        if args.task_mode == "trajectory_generalized":
+            frac = min(max(args.trajectory_fraction, 0.0), 1.0)
+            timed_envs = int(round(env.num_envs * frac))
+            env._trajectory_env_mask = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+            env._trajectory_env_mask[:timed_envs] = True
+        else:
+            env._trajectory_env_mask = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
     return env
 
 
@@ -278,11 +530,31 @@ def train(env: CrazyfliePointNavEnv, agent: L2FPPOAgent):
     target_z = args.target_z if args.target_z is not None else args.goal_z_min
     world_target_z = target_z + args.z_reference_offset
     use_fixed_goal = args.target_x is not None and args.target_y is not None
+    uses_trajectory_schedule = args.task_mode in ("trajectory_track", "trajectory_generalized")
     print(f"\n{'='*60}")
     print("HOLD FINE-TUNING")
     print(f"{'='*60}")
     print(f"  Task mode:          {args.task_mode}")
-    if use_fixed_goal:
+    if args.task_mode == "trajectory_track":
+        print(f"  Goal mode:          timed trajectory")
+        print(f"  Trajectory CSV:     {args.trajectory_csv}")
+        print(f"  Timed targets:      {env._trajectory_schedule_t.numel()}")
+        first_goal = env._trajectory_schedule_xyz[0].tolist()
+        print(f"  Initial goal (virtual): ({first_goal[0]:.2f}, {first_goal[1]:.2f}, {first_goal[2]:.2f}) m")
+        print(f"  Initial goal (world):   ({first_goal[0]:.2f}, {first_goal[1]:.2f}, {first_goal[2] + args.z_reference_offset:.2f}) m")
+        print(f"  Spawn z (world):    [{spawn_height_min:.2f}, {spawn_height_max:.2f}] m")
+    elif args.task_mode == "trajectory_generalized":
+        print(f"  Goal mode:          hybrid timed + random")
+        print(f"  Trajectory CSV:     {args.trajectory_csv}")
+        print(f"  Timed targets:      {env._trajectory_schedule_t.numel()}")
+        print(f"  Timed env fraction: {env._trajectory_env_mask.float().mean().item() * 100.0:.1f}%")
+        first_goal = env._trajectory_schedule_xyz[0].tolist()
+        print(f"  Initial timed goal (virtual): ({first_goal[0]:.2f}, {first_goal[1]:.2f}, {first_goal[2]:.2f}) m")
+        print(f"  Goal distance:      [{env.cfg.goal_min_distance:.2f}, {env.cfg.goal_max_distance:.2f}] m")
+        print(f"  Goal z (virtual):   [{args.goal_z_min:.2f}, {args.goal_z_max:.2f}] m")
+        print(f"  Goal z (world):     [{args.goal_z_min + args.z_reference_offset:.2f}, {args.goal_z_max + args.z_reference_offset:.2f}] m")
+        print(f"  Spawn z (world):    [{spawn_height_min:.2f}, {spawn_height_max:.2f}] m")
+    elif use_fixed_goal:
         print(f"  Goal mode:          fixed")
         print(f"  Goal (virtual):     ({args.target_x:.2f}, {args.target_y:.2f}, {target_z:.2f}) m")
         print(f"  Goal (world):       ({args.target_x:.2f}, {args.target_y:.2f}, {world_target_z:.2f}) m")
@@ -305,6 +577,9 @@ def train(env: CrazyfliePointNavEnv, agent: L2FPPOAgent):
     print(f"{'='*60}\n")
 
     obs_dict, _ = env.reset()
+    if uses_trajectory_schedule:
+        apply_timed_trajectory_goals(env, env._trajectory_schedule_t, env._trajectory_schedule_xyz, env._trajectory_env_mask)
+        obs_dict = env._get_observations()
     obs = obs_dict["policy"]
 
     best_reward = float("-inf")
@@ -341,6 +616,9 @@ def train(env: CrazyfliePointNavEnv, agent: L2FPPOAgent):
         rollout_topk_hold_steps = 0.0
 
         for _ in range(args.steps_per_rollout):
+            if uses_trajectory_schedule:
+                apply_timed_trajectory_goals(env, env._trajectory_schedule_t, env._trajectory_schedule_xyz, env._trajectory_env_mask)
+                obs = env._get_observations()["policy"]
             prev_goal_reached = env._goal_reached.clone()
             prev_goal_held = env._goal_held.clone()
 

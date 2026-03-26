@@ -250,6 +250,7 @@ class CrazyfliePointNavEnvCfg(DirectRLEnvCfg):
     hover_z_velocity_weight = 1.0  # Reduced from 2.0
     hover_angular_velocity_weight = 1.0  # Reduced from 2.0
     hover_action_weight = 0.01
+    hover_action_rate_weight = 0.02  # Penalize rapid motor command changes that create bobbing
     
     # Hover gating: reduce hover reward when far from goal
     # Prevents "survive stably" from dominating "reach goal"
@@ -270,6 +271,7 @@ class CrazyfliePointNavEnvCfg(DirectRLEnvCfg):
     # Height control rewards
     # FIXED: height_recovery is now delta-based (reward for climbing, not for being low)
     nav_height_recovery_weight = 1.0  # Reward for reducing deficit (climbing back up)
+    nav_height_descent_weight = 1.0  # Reward for reducing excess height (descending down)
     nav_height_track_weight = 0.5  # Gaussian reward for staying near target height
     
     # Speed penalty: penalize going too fast (above soft linvel threshold)
@@ -496,6 +498,8 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         
         # Previous height deficit (for delta-based height recovery reward)
         self._prev_height_below_target = torch.zeros(self.num_envs, device=self.device)
+        # Previous height excess (for symmetric descent reward when above target)
+        self._prev_height_above_target = torch.zeros(self.num_envs, device=self.device)
         
         # Track if goal was reached this episode
         self._goal_reached = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -511,12 +515,14 @@ class CrazyfliePointNavEnv(DirectRLEnv):
             "z_velocity_cost": torch.zeros(self.num_envs, device=self.device),
             "angular_velocity_cost": torch.zeros(self.num_envs, device=self.device),
             "action_cost": torch.zeros(self.num_envs, device=self.device),
+            "action_rate_cost": torch.zeros(self.num_envs, device=self.device),
             "hover_reward": torch.zeros(self.num_envs, device=self.device),
             "progress_reward": torch.zeros(self.num_envs, device=self.device),
             "braking_reward": torch.zeros(self.num_envs, device=self.device),
             "hold_step_reward": torch.zeros(self.num_envs, device=self.device),
             "hold_bonus": torch.zeros(self.num_envs, device=self.device),
             "speed_penalty": torch.zeros(self.num_envs, device=self.device),
+            "height_descent_reward": torch.zeros(self.num_envs, device=self.device),
             "reach_bonus": torch.zeros(self.num_envs, device=self.device),
             "total_reward": torch.zeros(self.num_envs, device=self.device),
             "goal_reached": torch.zeros(self.num_envs, device=self.device),
@@ -918,6 +924,8 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         # Action cost: penalize deviation from hover action
         action_deviation = self._actions - self._hover_action
         action_cost = (action_deviation ** 2).sum(dim=-1)
+        prev_action = self._action_history[:, -2]
+        action_rate_cost = ((self._actions - prev_action) ** 2).sum(dim=-1)
         
         # Weighted hover cost
         hover_cost = (
@@ -926,7 +934,8 @@ class CrazyfliePointNavEnv(DirectRLEnv):
             cfg.hover_xy_velocity_weight * xy_velocity_cost +
             cfg.hover_z_velocity_weight * z_velocity_cost +
             cfg.hover_angular_velocity_weight * angular_velocity_cost +
-            cfg.hover_action_weight * action_cost
+            cfg.hover_action_weight * action_cost +
+            cfg.hover_action_rate_weight * action_rate_cost
         )
         
         # Hover reward (positive when costs are low)
@@ -985,20 +994,26 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         # Update previous speed for next step
         self._prev_speed = speed_now.clone()
         
-        # Height tracking reward: Gaussian centered at target height
-        # Rewards staying near target, decays smoothly with distance
-        target_height = self._terrain.env_origins[:, 2] + cfg.init_target_height
+        # Height tracking reward: Gaussian centered at the live goal height.
+        # This must follow the current goal z, not the initial target height,
+        # otherwise moving/descending goals are undervalued during training.
+        target_height = self._goal_pos[:, 2]
         height_error = pos_w[:, 2] - target_height
         height_tracking_reward = cfg.nav_height_track_weight * torch.exp(-5.0 * height_error ** 2)
         
         # Height recovery reward: DELTA-based (reward for climbing, not for being low)
-        # FIXED: Only reward when reducing height deficit, not for being low
         height_below = torch.relu(target_height - pos_w[:, 2])  # >= 0 when below target
         height_recovery = self._prev_height_below_target - height_below  # positive when climbing
         height_recovery_reward = cfg.nav_height_recovery_weight * torch.clamp(height_recovery, -0.5, 0.5)
-        
-        # Update previous height deficit
+
+        # Symmetric descent reward: explicitly reward coming down when above target.
+        height_above = torch.relu(pos_w[:, 2] - target_height)  # >= 0 when above target
+        height_descent = self._prev_height_above_target - height_above  # positive when descending toward target
+        height_descent_reward = cfg.nav_height_descent_weight * torch.clamp(height_descent, -0.5, 0.5)
+
+        # Update previous height deficits/excesses
         self._prev_height_below_target = height_below.clone()
+        self._prev_height_above_target = height_above.clone()
         
         # Speed penalty: penalize going too fast horizontally (XY speed only)
         # Don't punish vertical corrections
@@ -1017,7 +1032,8 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         
         reward = (
             hover_reward + progress_reward + braking_reward + hold_step_reward + hold_bonus +
-            height_tracking_reward + height_recovery_reward + speed_penalty + low_height_penalty +
+            height_tracking_reward + height_recovery_reward + height_descent_reward +
+            speed_penalty + low_height_penalty +
             reach_bonus
         )
         
@@ -1028,11 +1044,13 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         self._episode_sums["z_velocity_cost"] += z_velocity_cost
         self._episode_sums["angular_velocity_cost"] += angular_velocity_cost
         self._episode_sums["action_cost"] += action_cost
+        self._episode_sums["action_rate_cost"] += action_rate_cost
         self._episode_sums["hover_reward"] += hover_reward
         self._episode_sums["progress_reward"] += progress_reward
         self._episode_sums["braking_reward"] += braking_reward
         self._episode_sums["hold_step_reward"] += hold_step_reward
         self._episode_sums["hold_bonus"] += hold_bonus
+        self._episode_sums["height_descent_reward"] += height_descent_reward
         self._episode_sums["speed_penalty"] += speed_penalty
         self._episode_sums["reach_bonus"] += reach_bonus
         self._episode_sums["total_reward"] += reward
@@ -1381,6 +1399,7 @@ class CrazyfliePointNavEnv(DirectRLEnv):
         
         # Initialize previous height deficit from the true goal height.
         self._prev_height_below_target[env_ids] = torch.clamp(self._goal_pos[env_ids, 2] - pos[:, 2], min=0.0)
+        self._prev_height_above_target[env_ids] = torch.clamp(pos[:, 2] - self._goal_pos[env_ids, 2], min=0.0)
         
         # Sample disturbances
         if cfg.enable_disturbance:
