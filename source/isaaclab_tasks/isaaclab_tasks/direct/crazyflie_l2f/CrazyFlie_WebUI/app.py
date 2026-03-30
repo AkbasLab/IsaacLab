@@ -33,6 +33,7 @@ Files:
 from __future__ import annotations
 
 import asyncio
+import csv
 import io
 import json
 import os
@@ -73,6 +74,7 @@ TELEM_PUMP_DT = 1.0 / TELEM_PUMP_HZ
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 UI_PATH = os.path.join(HERE, "ui.html")
+FLIGHTPLAN_DIR = os.path.join(HERE, "flightplans")
 
 # ----------------------------
 # State / Data Structures
@@ -939,6 +941,27 @@ def _build_plots_zip_from_csv_text(csv_text: str) -> bytes:
     return buffer.read()
 
 
+def _load_plan_waypoints_from_csv(filename: str) -> List[Dict[str, float]]:
+    path = os.path.join(FLIGHTPLAN_DIR, filename)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Flight plan not found: {filename}")
+
+    out: List[Dict[str, float]] = []
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            out.append(
+                {
+                    "x": float(row["x"]),
+                    "y": float(row["y"]),
+                    "z": float(row["z"]),
+                    "yaw": float(row.get("yaw", 0.0) or 0.0),
+                    "t": float(row["t"]),
+                }
+            )
+    return out
+
+
 # ----------------------------
 # FastAPI lifespan
 # ----------------------------
@@ -999,6 +1022,27 @@ async def export_plots(request: Request):
 
     headers = {"Content-Disposition": f'attachment; filename="flight_plots_{stamp}.zip"'}
     return Response(content=zip_bytes, media_type="application/zip", headers=headers)
+
+
+@app.get("/api/flightplans/{name}")
+async def get_flightplan(name: str):
+    plans = {
+        "figure8_3d_eval": "figure8_eval_origin_3x_webui.csv",
+    }
+    filename = plans.get(name)
+    if filename is None:
+        return Response(
+            content=json.dumps({"error": f"Unknown flight plan preset: {name}"}),
+            status_code=404,
+            media_type="application/json",
+        )
+
+    try:
+        waypoints = await asyncio.to_thread(_load_plan_waypoints_from_csv, filename)
+    except Exception as e:
+        return Response(content=json.dumps({"error": str(e)}), status_code=400, media_type="application/json")
+
+    return {"name": name, "loop": True, "waypoints": waypoints}
 
 
 @app.websocket("/ws")

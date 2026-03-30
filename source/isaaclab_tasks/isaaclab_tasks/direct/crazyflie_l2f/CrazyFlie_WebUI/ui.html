@@ -141,6 +141,7 @@
 
       <div class="row" style="gap:10px; margin-bottom:10px;">
         <button id="presetFig8Btn" class="mini-btn">Preset: Figure 8</button>
+        <button id="presetFig83DBtn" class="mini-btn">Preset: 3D Figure 8</button>
         <button id="presetCubeBtn" class="mini-btn">Preset: 3D Cube</button>
         <span class="badge mono">Points: <span id="ptCount">0</span></span>
         <span class="badge mono">Selected: <span id="selIdx">--</span></span>
@@ -1237,6 +1238,7 @@
 
   let fpMode = "draw";
   el("fpMode").textContent = fpMode;
+  let customTimedWaypoints = null;
 
   const tabDraw = el("tabDraw");
   const tabPoints = el("tabPoints");
@@ -1295,6 +1297,10 @@
   let selectedIdx = -1;
   let draggingIdx = -1;
 
+  function clearCustomTimedWaypoints(){
+    customTimedWaypoints = null;
+  }
+
   function updatePlanHud(){
     el("ptCount").textContent = String(ptsPx.length);
     el("selIdx").textContent = (selectedIdx >= 0) ? String(selectedIdx + 1) : "--";
@@ -1320,6 +1326,7 @@
     if(sampled.length === 0 || sampled[sampled.length-1] !== last) sampled.push(last);
     const baseZ = parseFloat(el("planZ").value || pointZDefault.value || '0.30');
     ptsPx = sampled.map(p => ({x:p.x, y:p.y, z:baseZ}));
+    clearCustomTimedWaypoints();
   }
 
   function pxToMeters(px, py, scale_m_per_100px){
@@ -1474,6 +1481,7 @@
       isDrawing = true;
       drawPtsPx = [];
       ptsPx = [];
+      clearCustomTimedWaypoints();
       selectedIdx = -1;
       draggingIdx = -1;
       drawPtsPx.push({x:p.x, y:p.y});
@@ -1494,6 +1502,7 @@
     }else{
       const z = (fpMode === '3d') ? parseFloat(pointZDefault.value || el("planZ").value || '0.30') : parseFloat(el("planZ").value || '0.30');
       ptsPx.push({x:p.x, y:p.y, z});
+      clearCustomTimedWaypoints();
       selectedIdx = ptsPx.length - 1;
       draggingIdx = selectedIdx;
       planCanvas.setPointerCapture(e.pointerId);
@@ -1518,6 +1527,7 @@
     if(draggingIdx >= 0){
       const prev = ptsPx[draggingIdx] || {};
       ptsPx[draggingIdx] = {x:p.x, y:p.y, z:pointZValue(prev)};
+      clearCustomTimedWaypoints();
       redrawPlan();
     }
   });
@@ -1549,6 +1559,7 @@
       y: cy - (nextMeters.y / s),
       z: (partial.z != null ? partial.z : pointZValue(current))
     };
+    clearCustomTimedWaypoints();
     redrawPlan();
     updatePlanHud();
   }
@@ -1581,6 +1592,7 @@
   el("delSelectedBtn").onclick = () => {
     if(selectedIdx < 0) return;
     ptsPx.splice(selectedIdx, 1);
+    clearCustomTimedWaypoints();
     selectedIdx = Math.min(selectedIdx, ptsPx.length - 1);
     draggingIdx = -1;
     updatePlanHud();
@@ -1590,6 +1602,7 @@
   el("clearPlanBtn").onclick = () => {
     drawPtsPx = [];
     ptsPx = [];
+    clearCustomTimedWaypoints();
     selectedIdx = -1;
     draggingIdx = -1;
     updatePlanHud();
@@ -1601,7 +1614,7 @@
     const speed = parseFloat(el("speedInput").value);
     const z = parseFloat(el("planZ").value);
     const loop = (el("loopSelect").value === "true");
-    const wps = buildTimedWaypoints(ptsPx, scale, z, speed);
+    const wps = customTimedWaypoints ? customTimedWaypoints.map(wp => ({...wp})) : buildTimedWaypoints(ptsPx, scale, z, speed);
     wsSend({type:"plan", waypoints:wps, loop:loop});
   };
 
@@ -1625,6 +1638,7 @@
 
     ptsPx = meterPts.map(m => ({ x: cx + (m.x / s), y: cy - (m.y / s), z: m.z }));
     drawPtsPx = ptsPx.map(p => ({x:p.x, y:p.y}));
+    clearCustomTimedWaypoints();
     selectedIdx = -1; draggingIdx = -1;
 
     updatePlanHud();
@@ -1633,6 +1647,42 @@
     const speed = parseFloat(el("speedInput").value);
     const wps = buildTimedWaypoints(ptsPx, scale_m_per_100px, z, speed);
     wsSend({type:"plan", waypoints:wps, loop:true});
+  }
+
+  async function presetFigure8_3d(){
+    try{
+      const resp = await fetch('/api/flightplans/figure8_3d_eval');
+      const data = await resp.json();
+      if(!resp.ok) throw new Error(data.error || 'Failed to load 3D figure-eight preset');
+
+      customTimedWaypoints = (data.waypoints || []).map(wp => ({
+        x: Number(wp.x),
+        y: Number(wp.y),
+        z: Number(wp.z),
+        yaw: Number(wp.yaw || 0.0),
+        t: Number(wp.t),
+      }));
+
+      const scale_m_per_100px = parseFloat(el("scaleInput").value);
+      const s = scale_m_per_100px / 100.0;
+      const cx = planCanvas.width/2, cy = planCanvas.height/2;
+      ptsPx = customTimedWaypoints.map(wp => ({
+        x: cx + (wp.x / s),
+        y: cy - (wp.y / s),
+        z: wp.z
+      }));
+      drawPtsPx = ptsPx.map(p => ({x:p.x, y:p.y}));
+      selectedIdx = 0;
+      draggingIdx = -1;
+      setFPMode('3d');
+      updatePlanHud();
+      redrawPlan();
+      wsSend({type:"plan", waypoints: customTimedWaypoints.map(wp => ({...wp})), loop: data.loop !== false});
+      addConsoleLine(`Preset loaded: 3D Figure 8 (${customTimedWaypoints.length} waypoints)`, "ok", new Date().toLocaleTimeString());
+    }catch(err){
+      alert(err.message || String(err));
+      addConsoleLine(`Failed to load 3D Figure 8 preset: ${err.message || err}`, "error", new Date().toLocaleTimeString());
+    }
   }
 
   function presetCube(){
@@ -1653,6 +1703,7 @@
     const cx = planCanvas.width/2, cy = planCanvas.height/2;
     ptsPx = cubePts.map(m => ({ x: cx + (m.x / s), y: cy - (m.y / s), z: m.z }));
     drawPtsPx = ptsPx.map(p => ({x:p.x, y:p.y}));
+    clearCustomTimedWaypoints();
     selectedIdx = 0; draggingIdx = -1;
     setFPMode('3d');
     updatePlanHud();
@@ -1660,6 +1711,7 @@
   }
 
   el("presetFig8Btn").onclick = presetFigure8;
+  el("presetFig83DBtn").onclick = presetFigure8_3d;
   el("presetCubeBtn").onclick = presetCube;
 
   // ========= Resize handling =========
