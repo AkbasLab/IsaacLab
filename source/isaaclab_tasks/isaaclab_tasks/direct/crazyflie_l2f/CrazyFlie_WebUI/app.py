@@ -476,7 +476,7 @@ def _try_start_logcfg(cf: Crazyflie, lc: LogConfig, note: str) -> bool:
         return False
 
 
-def _setup_logging(cf: Crazyflie, period_ms: int = LOG_PERIOD_MS) -> None:
+def _setup_logging(cf: Crazyflie, period_ms: int = LOG_PERIOD_MS, include_optional: bool = True) -> None:
     """
     Configure Crazyflie logging. Split configs to avoid packet size limits.
 
@@ -583,6 +583,9 @@ def _setup_logging(cf: Crazyflie, period_ms: int = LOG_PERIOD_MS) -> None:
             # If base logging fails, something is very wrong; raise.
             raise RuntimeError(f"Failed to start required log config: {lc.name}")
 
+    if not include_optional:
+        return
+
     # --- Optional: per-motor outputs (try multiple common name sets) ---
     motor_sets: List[Tuple[str, List[str]]] = [
         ("motor.m1..m4", ["motor.m1", "motor.m2", "motor.m3", "motor.m4"]),
@@ -632,7 +635,7 @@ def _promote_logging_period_after_connect(cf: Crazyflie) -> None:
         if STATE.cf is not cf or not STATE.connected:
             return
         try:
-            _setup_logging(cf, period_ms=LOG_PERIOD_MS)
+            _setup_logging(cf, period_ms=LOG_PERIOD_MS, include_optional=True)
         except Exception:
             # Keep the startup-safe logging period if reconfiguration fails.
             pass
@@ -690,7 +693,7 @@ def _connect_blocking(uri: str) -> None:
     # Clear previous runtime state
     _clear_telemetry_state()
 
-    _setup_logging(cf, period_ms=CONNECT_LOG_PERIOD_MS)
+    _setup_logging(cf, period_ms=CONNECT_LOG_PERIOD_MS, include_optional=False)
 
     STATE.cf = cf
     STATE.connected = True
