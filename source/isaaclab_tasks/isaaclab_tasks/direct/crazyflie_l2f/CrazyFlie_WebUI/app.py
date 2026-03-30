@@ -66,7 +66,7 @@ PLAN_HOLD_BEFORE_S = 1.0
 PLAN_HOLD_USE_PLAN_Z = True
 
 # Crazyflie log update rate
-CONNECT_LOG_PERIOD_MS = 20  # gentler startup period during connection/log setup
+CONNECT_LOG_PERIOD_MS = 100  # gentler startup period during connection/log setup
 LOG_PERIOD_MS = 10  # normal runtime period after the link is established
 LOG_PERIOD_SWITCH_DELAY_S = 1.0
 
