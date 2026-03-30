@@ -66,7 +66,9 @@ PLAN_HOLD_BEFORE_S = 1.0
 PLAN_HOLD_USE_PLAN_Z = True
 
 # Crazyflie log update rate
-LOG_PERIOD_MS = 10  # ~100 Hz-ish (depends on radio conditions)
+CONNECT_LOG_PERIOD_MS = 20  # gentler startup period during connection/log setup
+LOG_PERIOD_MS = 10  # normal runtime period after the link is established
+LOG_PERIOD_SWITCH_DELAY_S = 1.0
 
 # Telemetry broadcast rate (server -> UI)
 TELEM_PUMP_HZ = 20.0
@@ -474,7 +476,7 @@ def _try_start_logcfg(cf: Crazyflie, lc: LogConfig, note: str) -> bool:
         return False
 
 
-def _setup_logging(cf: Crazyflie) -> None:
+def _setup_logging(cf: Crazyflie, period_ms: int = LOG_PERIOD_MS) -> None:
     """
     Configure Crazyflie logging. Split configs to avoid packet size limits.
 
@@ -545,7 +547,7 @@ def _setup_logging(cf: Crazyflie) -> None:
             pass
 
     # --- Required / base logs (match flight_logger.py) ---
-    lc_pos_att = LogConfig(name="pos_att", period_in_ms=LOG_PERIOD_MS)
+    lc_pos_att = LogConfig(name="pos_att", period_in_ms=period_ms)
     for v in [
         "stateEstimate.x",
         "stateEstimate.y",
@@ -557,17 +559,17 @@ def _setup_logging(cf: Crazyflie) -> None:
         lc_pos_att.add_variable(v, "float")
     lc_pos_att.data_received_cb.add_callback(_log_cb)
 
-    lc_acc = LogConfig(name="acc", period_in_ms=LOG_PERIOD_MS)
+    lc_acc = LogConfig(name="acc", period_in_ms=period_ms)
     for v in ["acc.x", "acc.y", "acc.z"]:
         lc_acc.add_variable(v, "float")
     lc_acc.data_received_cb.add_callback(_log_cb)
 
-    lc_gyro = LogConfig(name="gyro", period_in_ms=LOG_PERIOD_MS)
+    lc_gyro = LogConfig(name="gyro", period_in_ms=period_ms)
     for v in ["gyro.x", "gyro.y", "gyro.z"]:
         lc_gyro.add_variable(v, "float")
     lc_gyro.data_received_cb.add_callback(_log_cb)
 
-    lc_bat = LogConfig(name="bat", period_in_ms=LOG_PERIOD_MS)
+    lc_bat = LogConfig(name="bat", period_in_ms=period_ms)
     lc_bat.add_variable("pm.vbat", "float")
     lc_bat.data_received_cb.add_callback(_log_cb)
 
@@ -588,7 +590,7 @@ def _setup_logging(cf: Crazyflie) -> None:
         ("pwm.m1..m4", ["pwm.m1", "pwm.m2", "pwm.m3", "pwm.m4"]),
     ]
     for label, vars_ in motor_sets:
-        lc = LogConfig(name=f"motors_{label}", period_in_ms=LOG_PERIOD_MS)
+        lc = LogConfig(name=f"motors_{label}", period_in_ms=period_ms)
         for v in vars_:
             lc.add_variable(v, "float")
         lc.data_received_cb.add_callback(_log_cb)
@@ -609,7 +611,7 @@ def _setup_logging(cf: Crazyflie) -> None:
          ["mag.x", "mag.y", "mag.z"]),
     ]
     for label, vars_ in imu_sets:
-        lc = LogConfig(name=f"imu_{label}", period_in_ms=LOG_PERIOD_MS)
+        lc = LogConfig(name=f"imu_{label}", period_in_ms=period_ms)
         for v in vars_:
             lc.add_variable(v, "float")
         lc.data_received_cb.add_callback(_log_cb)
@@ -617,11 +619,25 @@ def _setup_logging(cf: Crazyflie) -> None:
             break
 
     # --- Optional: velocity (stateEstimate.vx/vy/vz) ---
-    lc_vel = LogConfig(name="velocity", period_in_ms=LOG_PERIOD_MS)
+    lc_vel = LogConfig(name="velocity", period_in_ms=period_ms)
     for v in ["stateEstimate.vx", "stateEstimate.vy", "stateEstimate.vz"]:
         lc_vel.add_variable(v, "float")
     lc_vel.data_received_cb.add_callback(_log_cb)
     _try_start_logcfg(cf, lc_vel, "logging: velocity (stateEstimate.vx/vy/vz)")
+
+
+def _promote_logging_period_after_connect(cf: Crazyflie) -> None:
+    def _worker():
+        time.sleep(LOG_PERIOD_SWITCH_DELAY_S)
+        if STATE.cf is not cf or not STATE.connected:
+            return
+        try:
+            _setup_logging(cf, period_ms=LOG_PERIOD_MS)
+        except Exception:
+            # Keep the startup-safe logging period if reconfiguration fails.
+            pass
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 
 def _connect_blocking(uri: str) -> None:
@@ -674,11 +690,12 @@ def _connect_blocking(uri: str) -> None:
     # Clear previous runtime state
     _clear_telemetry_state()
 
-    _setup_logging(cf)
+    _setup_logging(cf, period_ms=CONNECT_LOG_PERIOD_MS)
 
     STATE.cf = cf
     STATE.connected = True
     STATE.uri = uri
+    _promote_logging_period_after_connect(cf)
 
 
 def _disconnect_blocking() -> None:
