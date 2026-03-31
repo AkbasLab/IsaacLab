@@ -7,10 +7,13 @@ This package provides training for Crazyflie hover policies compatible with L2F 
 
 Quick Start:
     Train a policy:
-        isaaclab.bat -p train_hover.py --num_envs 4096 --max_iterations 500
+        isaaclab.bat -p train_hover.py --algo ppo --num_envs 4096 --max_iterations 500
+        isaaclab.bat -p train_hover.py --algo sac --num_envs 4096 --max_iterations 500
+        isaaclab.bat -p train_hover.py --algo td3 --num_envs 4096 --max_iterations 500
+        isaaclab.bat -p train_hover.py --run_all --num_envs 4096 --max_iterations 500
     
     Play/test a trained policy:
-        isaaclab.bat -p train_hover.py --play --num_envs 4
+        isaaclab.bat -p train_hover.py --play --algo ppo --num_envs 4
 
 Main scripts:
     - train_hover.py: Unified training and evaluation script

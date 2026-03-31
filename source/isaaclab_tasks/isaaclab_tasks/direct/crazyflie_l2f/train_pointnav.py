@@ -25,10 +25,13 @@ Usage (from IsaacLab directory):
     .\\isaaclab.bat -p source\\isaaclab_tasks\\isaaclab_tasks\\direct\\crazyflie_l2f\\train_pointnav.py --sanity_test --num_envs 16
     
     # Training mode (headless, 4096 envs, 1000 iterations)
-    .\\isaaclab.bat -p source\\isaaclab_tasks\\isaaclab_tasks\\direct\\crazyflie_l2f\\train_pointnav.py --num_envs 4096 --max_iterations 1000 --headless
+    .\\isaaclab.bat -p source\\isaaclab_tasks\\isaaclab_tasks\\direct\\crazyflie_l2f\\train_pointnav.py --algo ppo --num_envs 4096 --max_iterations 1000 --headless
+    .\\isaaclab.bat -p source\\isaaclab_tasks\\isaaclab_tasks\\direct\\crazyflie_l2f\\train_pointnav.py --algo sac --num_envs 4096 --max_iterations 1000 --headless
+    .\\isaaclab.bat -p source\\isaaclab_tasks\\isaaclab_tasks\\direct\\crazyflie_l2f\\train_pointnav.py --algo td3 --num_envs 4096 --max_iterations 1000 --headless
+    .\\isaaclab.bat -p source\\isaaclab_tasks\\isaaclab_tasks\\direct\\crazyflie_l2f\\train_pointnav.py --run_all --num_envs 4096 --max_iterations 1000 --headless
     
     # Play mode with trained checkpoint
-    .\\isaaclab.bat -p source\\isaaclab_tasks\\isaaclab_tasks\\direct\\crazyflie_l2f\\train_pointnav.py --play --checkpoint source\\isaaclab_tasks\\isaaclab_tasks\\direct\\crazyflie_l2f\\checkpoints_pointnav\\best_model.pt --num_envs 64
+    .\\isaaclab.bat -p source\\isaaclab_tasks\\isaaclab_tasks\\direct\\crazyflie_l2f\\train_pointnav.py --play --algo ppo --checkpoint source\\isaaclab_tasks\\isaaclab_tasks\\direct\\crazyflie_l2f\\checkpoints_pointnav\\ppo\\best_model.pt --num_envs 64
 """
 
 from __future__ import annotations
@@ -37,8 +40,9 @@ import argparse
 import os
 import sys
 import math
+import subprocess
 from collections.abc import Sequence
-from typing import Tuple
+from typing import Any, Tuple
 
 import torch
 import torch.nn as nn
@@ -57,16 +61,35 @@ def parse_args():
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint for play mode or resume training")
     parser.add_argument("--resume", action="store_true", help="Resume training from checkpoint (uses --checkpoint or latest)")
     parser.add_argument("--sanity_test", action="store_true", help="Run sanity test (few steps, verify no crashes)")
+    parser.add_argument(
+        "--algo",
+        type=str,
+        default="ppo",
+        choices=["ppo", "sac", "td3"],
+        help="RL algorithm to use for training/play",
+    )
+    parser.add_argument("--run_all", action="store_true", help="Train and evaluate all supported algorithms")
     
     # Training parameters  
     parser.add_argument("--num_envs", type=int, default=4096, help="Number of environments")
     parser.add_argument("--max_iterations", type=int, default=1000, help="Maximum training iterations")
     parser.add_argument("--save_interval", type=int, default=100, help="Save checkpoint every N iterations")
+    parser.add_argument("--steps_per_rollout", type=int, default=256, help="Environment steps collected per iteration")
     
     # Hyperparameters (tuned for quadrotor)
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
     parser.add_argument("--batch_size", type=int, default=4096, help="Batch size")
+    parser.add_argument("--replay_size", type=int, default=500000, help="Replay buffer size for SAC/TD3")
+    parser.add_argument("--warmup_steps", type=int, default=10000, help="Random action steps before off-policy updates")
+    parser.add_argument("--updates_per_step", type=int, default=2, help="Gradient updates per env step for SAC/TD3")
+    parser.add_argument(
+        "--replay_device",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda"],
+        help="Device for replay buffer storage (auto uses GPU when available)",
+    )
     
     # AppLauncher adds its own args (including --headless)
     AppLauncher.add_app_launcher_args(parser)
@@ -76,19 +99,54 @@ def parse_args():
     return args
 
 
+args = parse_args()
+
+if __name__ == "__main__" and args.run_all and not args.play and not args.sanity_test:
+    algorithms = ["ppo", "sac", "td3"]
+    base_cmd = [
+        sys.executable,
+        __file__,
+        "--num_envs", str(args.num_envs),
+        "--max_iterations", str(args.max_iterations),
+        "--save_interval", str(args.save_interval),
+        "--steps_per_rollout", str(args.steps_per_rollout),
+        "--lr", str(args.lr),
+        "--gamma", str(args.gamma),
+        "--batch_size", str(args.batch_size),
+        "--replay_size", str(args.replay_size),
+        "--warmup_steps", str(args.warmup_steps),
+        "--updates_per_step", str(args.updates_per_step),
+        "--replay_device", str(args.replay_device),
+    ]
+    if getattr(args, "headless", False):
+        base_cmd.append("--headless")
+    if getattr(args, "device", None):
+        base_cmd.extend(["--device", str(args.device)])
+
+    for algo in algorithms:
+        print(f"\n>>> Running algorithm in fresh process: {algo.upper()}")
+        cmd = base_cmd + ["--algo", algo]
+        result = subprocess.run(cmd, check=False)
+        if result.returncode != 0:
+            print(f"Error: {algo.upper()} subprocess exited with code {result.returncode}")
+            break
+    sys.exit(0)
+
+
 # Check if Isaac Sim is already running (i.e., we're being imported by another script)
 def _is_isaac_sim_running():
     """Check if Isaac Sim/Omniverse is already initialized."""
     try:
-        import carb
-        return carb.get_framework() is not None
-    except (ImportError, AttributeError):
+        import omni.kit.app
+
+        app = omni.kit.app.get_app()
+        return app is not None
+    except Exception:
         return False
 
 # Only initialize AppLauncher if Isaac Sim isn't already running
 if _is_isaac_sim_running():
     # Being imported by another script that already initialized Isaac Sim
-    args = parse_args()
     # Get simulation_app reference
     try:
         import omni.kit.app
@@ -97,7 +155,6 @@ if _is_isaac_sim_running():
         simulation_app = None
 else:
     # We're the main entry point - initialize Isaac Sim
-    args = parse_args()
     app_launcher = AppLauncher(args)
     simulation_app = app_launcher.app
 
@@ -1576,6 +1633,10 @@ class L2FPPOAgent:
         if update:
             self.obs_normalizer.update(obs)
         return self.obs_normalizer.normalize(obs)
+
+    def update_obs_stats(self, obs: torch.Tensor):
+        if self.normalize_observations:
+            self.obs_normalizer.update(obs)
     
     def get_action(self, obs: torch.Tensor, deterministic: bool = False):
         with torch.no_grad():
@@ -1653,6 +1714,367 @@ class L2FPPOAgent:
         self.actor.log_std.data = checkpoint["log_std"]
         if "optimizer" in checkpoint:
             self.optimizer.load_state_dict(checkpoint["optimizer"])
+        if "obs_mean" in checkpoint:
+            self.obs_normalizer.mean = checkpoint["obs_mean"].to(self.device)
+            self.obs_normalizer.var = checkpoint["obs_var"].to(self.device)
+            self.obs_normalizer.count = checkpoint["obs_count"]
+        return checkpoint.get("iteration", 0), checkpoint.get("best_reward", 0.0)
+
+
+class ReplayBuffer:
+    """Simple vectorized replay buffer for off-policy algorithms."""
+
+    def __init__(self, capacity: int, obs_dim: int, action_dim: int, device: torch.device):
+        self.capacity = capacity
+        self.device = device
+        self.obs = torch.zeros((capacity, obs_dim), dtype=torch.float32, device=device)
+        self.actions = torch.zeros((capacity, action_dim), dtype=torch.float32, device=device)
+        self.rewards = torch.zeros((capacity, 1), dtype=torch.float32, device=device)
+        self.next_obs = torch.zeros((capacity, obs_dim), dtype=torch.float32, device=device)
+        self.dones = torch.zeros((capacity, 1), dtype=torch.float32, device=device)
+        self.ptr = 0
+        self.size = 0
+
+    def add_batch(self, obs: torch.Tensor, actions: torch.Tensor, rewards: torch.Tensor, next_obs: torch.Tensor, dones: torch.Tensor):
+        obs = obs.detach().to(self.device)
+        actions = actions.detach().to(self.device)
+        rewards = rewards.detach().unsqueeze(-1).to(self.device)
+        next_obs = next_obs.detach().to(self.device)
+        dones = dones.detach().float().unsqueeze(-1).to(self.device)
+
+        batch_size = obs.shape[0]
+        idx = (torch.arange(batch_size, device=self.device) + self.ptr) % self.capacity
+
+        self.obs[idx] = obs
+        self.actions[idx] = actions
+        self.rewards[idx] = rewards
+        self.next_obs[idx] = next_obs
+        self.dones[idx] = dones
+
+        self.ptr = (self.ptr + batch_size) % self.capacity
+        self.size = min(self.size + batch_size, self.capacity)
+
+    def sample(self, batch_size: int, device: torch.device):
+        idx = torch.randint(0, self.size, (batch_size,), device=self.device)
+        return {
+            "obs": self.obs[idx].to(device),
+            "actions": self.actions[idx].to(device),
+            "rewards": self.rewards[idx].to(device),
+            "next_obs": self.next_obs[idx].to(device),
+            "dones": self.dones[idx].to(device),
+        }
+
+
+class L2FSquashedGaussianActor(nn.Module):
+    """Tanh-squashed Gaussian actor for SAC."""
+
+    def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int = 64):
+        super().__init__()
+        self.fc1 = nn.Linear(obs_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.mean = nn.Linear(hidden_dim, action_dim)
+        self.log_std = nn.Linear(hidden_dim, action_dim)
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in [self.fc1, self.fc2]:
+            nn.init.orthogonal_(m.weight, gain=1.0)
+            nn.init.zeros_(m.bias)
+        nn.init.orthogonal_(self.mean.weight, gain=0.01)
+        nn.init.zeros_(self.mean.bias)
+        nn.init.orthogonal_(self.log_std.weight, gain=0.01)
+        nn.init.zeros_(self.log_std.bias)
+
+    def forward(self, obs: torch.Tensor):
+        x = torch.tanh(self.fc1(obs))
+        x = torch.tanh(self.fc2(x))
+        mean = self.mean(x)
+        log_std = torch.clamp(self.log_std(x), -5.0, 2.0)
+        return mean, log_std
+
+    def sample(self, obs: torch.Tensor):
+        mean, log_std = self.forward(obs)
+        std = torch.exp(log_std)
+        dist = torch.distributions.Normal(mean, std)
+        z = dist.rsample()
+        action = torch.tanh(z)
+        log_prob = dist.log_prob(z) - torch.log(1.0 - action.pow(2) + 1e-6)
+        log_prob = log_prob.sum(dim=-1, keepdim=True)
+        return action, log_prob, torch.tanh(mean)
+
+
+class L2FDeterministicActor(nn.Module):
+    """Deterministic actor for TD3."""
+
+    def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int = 64):
+        super().__init__()
+        self.fc1 = nn.Linear(obs_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, action_dim)
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in [self.fc1, self.fc2]:
+            nn.init.orthogonal_(m.weight, gain=1.0)
+            nn.init.zeros_(m.bias)
+        nn.init.orthogonal_(self.fc3.weight, gain=0.01)
+        nn.init.zeros_(self.fc3.bias)
+
+    def forward(self, obs: torch.Tensor):
+        x = torch.tanh(self.fc1(obs))
+        x = torch.tanh(self.fc2(x))
+        return torch.tanh(self.fc3(x))
+
+
+class L2FQNetwork(nn.Module):
+    """Q-network for SAC/TD3."""
+
+    def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int = 64):
+        super().__init__()
+        self.fc1 = nn.Linear(obs_dim + action_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, 1)
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in [self.fc1, self.fc2, self.fc3]:
+            nn.init.orthogonal_(m.weight, gain=1.0)
+            nn.init.zeros_(m.bias)
+
+    def forward(self, obs: torch.Tensor, action: torch.Tensor):
+        x = torch.cat([obs, action], dim=-1)
+        x = torch.tanh(self.fc1(x))
+        x = torch.tanh(self.fc2(x))
+        return self.fc3(x)
+
+
+class L2FSACAgent:
+    """SAC agent for continuous motor control."""
+
+    def __init__(self, obs_dim: int = 149, action_dim: int = 4, device: torch.device = None, lr: float = 3e-4, gamma: float = 0.99, tau: float = 0.005, alpha: float = 0.2):
+        self.device = device
+        self.gamma = gamma
+        self.tau = tau
+        self.alpha = alpha
+
+        self.actor = L2FSquashedGaussianActor(obs_dim, action_dim).to(device)
+        self.q1 = L2FQNetwork(obs_dim, action_dim).to(device)
+        self.q2 = L2FQNetwork(obs_dim, action_dim).to(device)
+        self.q1_target = L2FQNetwork(obs_dim, action_dim).to(device)
+        self.q2_target = L2FQNetwork(obs_dim, action_dim).to(device)
+        self.q1_target.load_state_dict(self.q1.state_dict())
+        self.q2_target.load_state_dict(self.q2.state_dict())
+
+        self.obs_normalizer = RunningMeanStd((obs_dim,), device=device)
+
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=lr)
+        self.q_opt = torch.optim.Adam(list(self.q1.parameters()) + list(self.q2.parameters()), lr=lr)
+
+    def normalize_obs(self, obs: torch.Tensor, update: bool = False):
+        if update:
+            self.obs_normalizer.update(obs)
+        return self.obs_normalizer.normalize(obs)
+
+    def update_obs_stats(self, obs: torch.Tensor):
+        self.obs_normalizer.update(obs)
+
+    def get_action(self, obs: torch.Tensor, deterministic: bool = False):
+        with torch.no_grad():
+            obs_norm = self.normalize_obs(obs, update=False)
+            if deterministic:
+                mean, _ = self.actor(obs_norm)
+                return torch.tanh(mean)
+            action, _, _ = self.actor.sample(obs_norm)
+            return action
+
+    def update(self, batch: dict):
+        obs = self.normalize_obs(batch["obs"], update=False)
+        actions = batch["actions"]
+        rewards = batch["rewards"]
+        next_obs = self.normalize_obs(batch["next_obs"], update=False)
+        dones = batch["dones"]
+
+        with torch.no_grad():
+            next_action, next_log_prob, _ = self.actor.sample(next_obs)
+            next_q1 = self.q1_target(next_obs, next_action)
+            next_q2 = self.q2_target(next_obs, next_action)
+            next_q = torch.min(next_q1, next_q2) - self.alpha * next_log_prob
+            target_q = rewards + self.gamma * (1.0 - dones) * next_q
+
+        q1_loss = ((self.q1(obs, actions) - target_q) ** 2).mean()
+        q2_loss = ((self.q2(obs, actions) - target_q) ** 2).mean()
+        q_loss = q1_loss + q2_loss
+
+        self.q_opt.zero_grad()
+        q_loss.backward()
+        self.q_opt.step()
+
+        new_actions, log_prob, _ = self.actor.sample(obs)
+        q_pi = torch.min(self.q1(obs, new_actions), self.q2(obs, new_actions))
+        actor_loss = (self.alpha * log_prob - q_pi).mean()
+
+        self.actor_opt.zero_grad()
+        actor_loss.backward()
+        self.actor_opt.step()
+
+        for param, target in zip(self.q1.parameters(), self.q1_target.parameters(), strict=False):
+            target.data.mul_(1.0 - self.tau).add_(self.tau * param.data)
+        for param, target in zip(self.q2.parameters(), self.q2_target.parameters(), strict=False):
+            target.data.mul_(1.0 - self.tau).add_(self.tau * param.data)
+
+        return {"q_loss": q_loss.item(), "actor_loss": actor_loss.item()}
+
+    def save(self, path: str, iteration: int, best_reward: float):
+        torch.save({
+            "iteration": iteration,
+            "best_reward": best_reward,
+            "algo": "sac",
+            "actor": self.actor.state_dict(),
+            "q1": self.q1.state_dict(),
+            "q2": self.q2.state_dict(),
+            "q1_target": self.q1_target.state_dict(),
+            "q2_target": self.q2_target.state_dict(),
+            "actor_opt": self.actor_opt.state_dict(),
+            "q_opt": self.q_opt.state_dict(),
+            "obs_mean": self.obs_normalizer.mean,
+            "obs_var": self.obs_normalizer.var,
+            "obs_count": self.obs_normalizer.count,
+        }, path)
+
+    def load(self, path: str):
+        checkpoint = torch.load(path, map_location=self.device)
+        self.actor.load_state_dict(checkpoint["actor"])
+        self.q1.load_state_dict(checkpoint["q1"])
+        self.q2.load_state_dict(checkpoint["q2"])
+        self.q1_target.load_state_dict(checkpoint["q1_target"])
+        self.q2_target.load_state_dict(checkpoint["q2_target"])
+        if "actor_opt" in checkpoint:
+            self.actor_opt.load_state_dict(checkpoint["actor_opt"])
+        if "q_opt" in checkpoint:
+            self.q_opt.load_state_dict(checkpoint["q_opt"])
+        if "obs_mean" in checkpoint:
+            self.obs_normalizer.mean = checkpoint["obs_mean"].to(self.device)
+            self.obs_normalizer.var = checkpoint["obs_var"].to(self.device)
+            self.obs_normalizer.count = checkpoint["obs_count"]
+        return checkpoint.get("iteration", 0), checkpoint.get("best_reward", 0.0)
+
+
+class L2FTD3Agent:
+    """TD3 agent for continuous motor control."""
+
+    def __init__(self, obs_dim: int = 149, action_dim: int = 4, device: torch.device = None, lr: float = 3e-4, gamma: float = 0.99, tau: float = 0.005, policy_noise: float = 0.2, noise_clip: float = 0.5, policy_delay: int = 2, exploration_noise: float = 0.1):
+        self.device = device
+        self.gamma = gamma
+        self.tau = tau
+        self.policy_noise = policy_noise
+        self.noise_clip = noise_clip
+        self.policy_delay = policy_delay
+        self.exploration_noise = exploration_noise
+        self.update_step = 0
+
+        self.actor = L2FDeterministicActor(obs_dim, action_dim).to(device)
+        self.actor_target = L2FDeterministicActor(obs_dim, action_dim).to(device)
+        self.actor_target.load_state_dict(self.actor.state_dict())
+
+        self.q1 = L2FQNetwork(obs_dim, action_dim).to(device)
+        self.q2 = L2FQNetwork(obs_dim, action_dim).to(device)
+        self.q1_target = L2FQNetwork(obs_dim, action_dim).to(device)
+        self.q2_target = L2FQNetwork(obs_dim, action_dim).to(device)
+        self.q1_target.load_state_dict(self.q1.state_dict())
+        self.q2_target.load_state_dict(self.q2.state_dict())
+
+        self.obs_normalizer = RunningMeanStd((obs_dim,), device=device)
+
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=lr)
+        self.q_opt = torch.optim.Adam(list(self.q1.parameters()) + list(self.q2.parameters()), lr=lr)
+
+    def normalize_obs(self, obs: torch.Tensor, update: bool = False):
+        if update:
+            self.obs_normalizer.update(obs)
+        return self.obs_normalizer.normalize(obs)
+
+    def update_obs_stats(self, obs: torch.Tensor):
+        self.obs_normalizer.update(obs)
+
+    def get_action(self, obs: torch.Tensor, deterministic: bool = False):
+        with torch.no_grad():
+            obs_norm = self.normalize_obs(obs, update=False)
+            action = self.actor(obs_norm)
+            if deterministic:
+                return action
+            noise = torch.randn_like(action) * self.exploration_noise
+            return (action + noise).clamp(-1.0, 1.0)
+
+    def update(self, batch: dict):
+        self.update_step += 1
+
+        obs = self.normalize_obs(batch["obs"], update=False)
+        actions = batch["actions"]
+        rewards = batch["rewards"]
+        next_obs = self.normalize_obs(batch["next_obs"], update=False)
+        dones = batch["dones"]
+
+        with torch.no_grad():
+            noise = (torch.randn_like(actions) * self.policy_noise).clamp(-self.noise_clip, self.noise_clip)
+            next_action = (self.actor_target(next_obs) + noise).clamp(-1.0, 1.0)
+            next_q1 = self.q1_target(next_obs, next_action)
+            next_q2 = self.q2_target(next_obs, next_action)
+            target_q = rewards + self.gamma * (1.0 - dones) * torch.min(next_q1, next_q2)
+
+        q1_loss = ((self.q1(obs, actions) - target_q) ** 2).mean()
+        q2_loss = ((self.q2(obs, actions) - target_q) ** 2).mean()
+        q_loss = q1_loss + q2_loss
+
+        self.q_opt.zero_grad()
+        q_loss.backward()
+        self.q_opt.step()
+
+        actor_loss = torch.tensor(0.0, device=self.device)
+        if self.update_step % self.policy_delay == 0:
+            actor_loss = -self.q1(obs, self.actor(obs)).mean()
+            self.actor_opt.zero_grad()
+            actor_loss.backward()
+            self.actor_opt.step()
+
+            for param, target in zip(self.actor.parameters(), self.actor_target.parameters(), strict=False):
+                target.data.mul_(1.0 - self.tau).add_(self.tau * param.data)
+            for param, target in zip(self.q1.parameters(), self.q1_target.parameters(), strict=False):
+                target.data.mul_(1.0 - self.tau).add_(self.tau * param.data)
+            for param, target in zip(self.q2.parameters(), self.q2_target.parameters(), strict=False):
+                target.data.mul_(1.0 - self.tau).add_(self.tau * param.data)
+
+        return {"q_loss": q_loss.item(), "actor_loss": actor_loss.item()}
+
+    def save(self, path: str, iteration: int, best_reward: float):
+        torch.save({
+            "iteration": iteration,
+            "best_reward": best_reward,
+            "algo": "td3",
+            "actor": self.actor.state_dict(),
+            "actor_target": self.actor_target.state_dict(),
+            "q1": self.q1.state_dict(),
+            "q2": self.q2.state_dict(),
+            "q1_target": self.q1_target.state_dict(),
+            "q2_target": self.q2_target.state_dict(),
+            "actor_opt": self.actor_opt.state_dict(),
+            "q_opt": self.q_opt.state_dict(),
+            "obs_mean": self.obs_normalizer.mean,
+            "obs_var": self.obs_normalizer.var,
+            "obs_count": self.obs_normalizer.count,
+        }, path)
+
+    def load(self, path: str):
+        checkpoint = torch.load(path, map_location=self.device)
+        self.actor.load_state_dict(checkpoint["actor"])
+        self.actor_target.load_state_dict(checkpoint["actor_target"])
+        self.q1.load_state_dict(checkpoint["q1"])
+        self.q2.load_state_dict(checkpoint["q2"])
+        self.q1_target.load_state_dict(checkpoint["q1_target"])
+        self.q2_target.load_state_dict(checkpoint["q2_target"])
+        if "actor_opt" in checkpoint:
+            self.actor_opt.load_state_dict(checkpoint["actor_opt"])
+        if "q_opt" in checkpoint:
+            self.q_opt.load_state_dict(checkpoint["q_opt"])
         if "obs_mean" in checkpoint:
             self.obs_normalizer.mean = checkpoint["obs_mean"].to(self.device)
             self.obs_normalizer.var = checkpoint["obs_var"].to(self.device)
@@ -1753,12 +2175,9 @@ def sanity_test(env: CrazyfliePointNavEnv, num_steps: int = 100):
     print("="*60 + "\n")
 
 
-def train(env: CrazyfliePointNavEnv, agent: L2FPPOAgent, args):
-    """Main training loop."""
-    checkpoint_dir = os.path.join(os.path.dirname(__file__), "checkpoints_pointnav")
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    
-    steps_per_rollout = 256  # Longer rollouts for navigation
+def train_ppo(env: CrazyfliePointNavEnv, agent: L2FPPOAgent, args, checkpoint_dir: str):
+    """Main PPO training loop."""
+    steps_per_rollout = args.steps_per_rollout
     num_envs = env.num_envs
     
     best_reward = float("-inf")
@@ -1940,7 +2359,118 @@ def train(env: CrazyfliePointNavEnv, agent: L2FPPOAgent, args):
     print(f"Checkpoints saved to: {checkpoint_dir}")
 
 
-def play(env: CrazyfliePointNavEnv, agent: L2FPPOAgent, checkpoint_path: str):
+def train_offpolicy(env: CrazyfliePointNavEnv, agent, args, checkpoint_dir: str, algo_name: str):
+    """Shared off-policy training loop for SAC and TD3."""
+    steps_per_rollout = args.steps_per_rollout
+    num_envs = env.num_envs
+    best_reward = float("-inf")
+    best_reach_rate = 0.0
+    obs_dim = env.cfg.observation_space if isinstance(env.cfg.observation_space, int) else 149
+    action_dim = env.cfg.action_space if isinstance(env.cfg.action_space, int) else 4
+
+    env_device = env.device if isinstance(env.device, torch.device) else torch.device(str(env.device))
+    if args.replay_device == "auto":
+        replay_device = env_device if env_device.type == "cuda" else torch.device("cpu")
+    elif args.replay_device == "cuda":
+        replay_device = torch.device("cuda")
+    else:
+        replay_device = torch.device("cpu")
+
+    replay = ReplayBuffer(args.replay_size, obs_dim, action_dim, replay_device)
+
+    print(f"\n{'='*60}")
+    print(f"Starting L2F Point Navigation {algo_name.upper()} Training")
+    print(f"{'='*60}")
+    print(f"  Environments:       {num_envs}")
+    print(f"  Max iterations:     {args.max_iterations}")
+    print(f"  Steps per rollout:  {steps_per_rollout}")
+    print(f"  Replay size:        {args.replay_size}")
+    print(f"  Warmup steps:       {args.warmup_steps}")
+    print(f"  Batch size:         {args.batch_size}")
+    print(f"  Replay device:      {replay_device}")
+    print(f"{'='*60}\n")
+
+    obs_dict, _ = env.reset()
+    obs = obs_dict["policy"]
+    total_steps = 0
+    start_iteration = 0
+
+    if args.resume:
+        ckpt_path = args.checkpoint or os.path.join(checkpoint_dir, "best_model.pt")
+        if not os.path.exists(ckpt_path):
+            ckpt_path = os.path.join(checkpoint_dir, "final_model.pt")
+        if os.path.exists(ckpt_path):
+            print(f"\n[Resume] Loading checkpoint: {ckpt_path}")
+            start_iteration, best_reward = agent.load(ckpt_path)
+            print(f"[Resume] Starting from iteration {start_iteration}, best_reward={best_reward:.2f}")
+
+    for iteration in range(start_iteration, start_iteration + args.max_iterations):
+        episode_rewards = torch.zeros(num_envs, device=env.device)
+        reach_count = 0
+        episode_count = 0
+        mean_q_loss = 0.0
+        mean_actor_loss = 0.0
+        num_updates = 0
+
+        for _ in range(steps_per_rollout):
+            agent.update_obs_stats(obs)
+            if total_steps < args.warmup_steps:
+                action = torch.rand((num_envs, env.cfg.action_space), device=env.device) * 2.0 - 1.0
+            else:
+                action = agent.get_action(obs, deterministic=False)
+
+            obs_dict, reward, terminated, truncated, _ = env.step(action)
+            next_obs = obs_dict["policy"]
+            done = terminated | truncated
+
+            replay.add_batch(obs, action, reward, next_obs, done)
+            agent.update_obs_stats(next_obs)
+
+            if "log" in env.extras and "Episode/reach_rate" in env.extras["log"]:
+                reach_count += env.extras["log"]["Episode/reach_rate"] * done.sum().item()
+                episode_count += done.sum().item()
+
+            obs = next_obs
+            episode_rewards += reward
+            total_steps += num_envs
+
+            if replay.size >= args.batch_size:
+                for _ in range(args.updates_per_step):
+                    update_info = agent.update(replay.sample(args.batch_size, env.device))
+                    mean_q_loss += update_info.get("q_loss", 0.0)
+                    mean_actor_loss += update_info.get("actor_loss", 0.0)
+                    num_updates += 1
+
+        mean_reward = episode_rewards.mean().item() / steps_per_rollout
+        reach_rate = reach_count / max(episode_count, 1) if episode_count > 0 else 0.0
+        q_loss = mean_q_loss / max(num_updates, 1)
+        actor_loss = mean_actor_loss / max(num_updates, 1)
+
+        is_best = mean_reward > best_reward
+        if is_best:
+            best_reward = mean_reward
+            agent.save(os.path.join(checkpoint_dir, "best_model.pt"), iteration, best_reward)
+
+        if reach_rate > best_reach_rate:
+            best_reach_rate = reach_rate
+            agent.save(os.path.join(checkpoint_dir, "best_reach_model.pt"), iteration, best_reward)
+
+        if iteration % 10 == 0 or is_best:
+            star = " *BEST*" if is_best else ""
+            print(
+                f"[{algo_name.upper()} Iter {iteration:4d}] Reward: {mean_reward:8.3f} | "
+                f"Reach: {reach_rate*100:5.1f}% | QLoss: {q_loss:8.4f} | ActorLoss: {actor_loss:8.4f}{star}"
+            )
+
+        if iteration > 0 and iteration % args.save_interval == 0:
+            agent.save(os.path.join(checkpoint_dir, f"checkpoint_{iteration}.pt"), iteration, best_reward)
+
+    agent.save(os.path.join(checkpoint_dir, "final_model.pt"), args.max_iterations, best_reward)
+    print(f"\nTraining complete! Best reward: {best_reward:.3f}, Best reach rate: {best_reach_rate*100:.1f}%")
+    print(f"Checkpoints saved to: {checkpoint_dir}")
+
+
+def play(env: CrazyfliePointNavEnv, agent, checkpoint_path: str):
     """Run trained policy with visualization and data logging."""
     
     iteration, best_reward = agent.load(checkpoint_path)
@@ -1970,7 +2500,7 @@ def play(env: CrazyfliePointNavEnv, agent: L2FPPOAgent, checkpoint_path: str):
     title_prefix = "Point Navigation Evaluation"
     
     try:
-        while simulation_app.is_running():
+        while simulation_app is None or simulation_app.is_running():
             action = agent.get_action(obs, deterministic=True)
             obs_dict, reward, terminated, truncated, info = env.step(action)
             obs = obs_dict["policy"]
@@ -2008,47 +2538,97 @@ def play(env: CrazyfliePointNavEnv, agent: L2FPPOAgent, checkpoint_path: str):
 # ==============================================================================
 
 def main():
-    # Create config
-    cfg = CrazyfliePointNavEnvCfg()
-    cfg.scene.num_envs = args.num_envs
-    
-    # Create environment
-    env = CrazyfliePointNavEnv(cfg)
-    
-    if args.sanity_test:
-        # Sanity test mode
-        sanity_test(env)
-        env.close()
-        simulation_app.close()
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
+    if args.run_all and not args.play and not args.sanity_test:
+        if simulation_app is not None:
+            simulation_app.close()
+
+        algorithms = ["ppo", "sac", "td3"]
+        base_cmd = [
+            sys.executable,
+            __file__,
+            "--num_envs", str(args.num_envs),
+            "--max_iterations", str(args.max_iterations),
+            "--save_interval", str(args.save_interval),
+            "--steps_per_rollout", str(args.steps_per_rollout),
+            "--lr", str(args.lr),
+            "--gamma", str(args.gamma),
+            "--batch_size", str(args.batch_size),
+            "--replay_size", str(args.replay_size),
+            "--warmup_steps", str(args.warmup_steps),
+            "--updates_per_step", str(args.updates_per_step),
+            "--replay_device", str(args.replay_device),
+        ]
+        if getattr(args, "headless", False):
+            base_cmd.append("--headless")
+        if getattr(args, "device", None):
+            base_cmd.extend(["--device", str(args.device)])
+
+        for algo in algorithms:
+            print(f"\n>>> Running algorithm in fresh process: {algo.upper()}")
+            cmd = base_cmd + ["--algo", algo]
+            result = subprocess.run(cmd, check=False)
+            if result.returncode != 0:
+                print(f"Error: {algo.upper()} subprocess exited with code {result.returncode}")
+                break
         return
-    
-    # Create agent
-    agent = L2FPPOAgent(
-        obs_dim=cfg.observation_space,
-        action_dim=cfg.action_space,
-        device=env.device,
-        lr=args.lr,
-        gamma=args.gamma,
-    )
-    
-    if args.play:
-        # Play mode
-        if args.checkpoint is None:
-            checkpoint_dir = os.path.join(os.path.dirname(__file__), "checkpoints_pointnav")
-            args.checkpoint = os.path.join(checkpoint_dir, "best_model.pt")
-        
-        if not os.path.exists(args.checkpoint):
-            print(f"Error: Checkpoint not found: {args.checkpoint}")
-            sys.exit(1)
-        
-        play(env, agent, args.checkpoint)
-    else:
-        # Training mode
-        train(env, agent, args)
-    
-    # Cleanup
-    env.close()
-    simulation_app.close()
+
+    def get_checkpoint_dir(algo: str) -> str:
+        checkpoint_dir = os.path.join(os.path.dirname(__file__), "checkpoints_pointnav", algo)
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        return checkpoint_dir
+
+    def create_agent(cfg: CrazyfliePointNavEnvCfg, env_device: torch.device, algo: str) -> Any:
+        obs_dim = cfg.observation_space if isinstance(cfg.observation_space, int) else 149
+        action_dim = cfg.action_space if isinstance(cfg.action_space, int) else 4
+
+        if algo == "ppo":
+            return L2FPPOAgent(obs_dim=obs_dim, action_dim=action_dim, device=env_device, lr=args.lr, gamma=args.gamma)
+        if algo == "sac":
+            return L2FSACAgent(obs_dim=obs_dim, action_dim=action_dim, device=env_device, lr=args.lr, gamma=args.gamma)
+        if algo == "td3":
+            return L2FTD3Agent(obs_dim=obs_dim, action_dim=action_dim, device=env_device, lr=args.lr, gamma=args.gamma)
+        raise ValueError(f"Unsupported algorithm: {algo}")
+
+    def run_single_algorithm(algo: str):
+        cfg = CrazyfliePointNavEnvCfg()
+        cfg.scene.num_envs = args.num_envs
+        env = CrazyfliePointNavEnv(cfg)
+        checkpoint_dir = get_checkpoint_dir(algo)
+        agent = create_agent(cfg, env.device, algo)
+
+        try:
+            if args.sanity_test:
+                sanity_test(env)
+                return
+
+            if args.play:
+                checkpoint = args.checkpoint or os.path.join(checkpoint_dir, "best_model.pt")
+                if not os.path.exists(checkpoint):
+                    print(f"Error: Checkpoint not found: {checkpoint}")
+                    return
+                play(env, agent, checkpoint)
+                return
+
+            if algo == "ppo":
+                train_ppo(env, agent, args, checkpoint_dir)
+            else:
+                train_offpolicy(env, agent, args, checkpoint_dir, algo)
+        finally:
+            env.close()
+
+    algorithms = ["ppo", "sac", "td3"] if args.run_all and not args.play else [args.algo]
+    for algo in algorithms:
+        print(f"\n>>> Running algorithm: {algo.upper()}")
+        run_single_algorithm(algo)
+
+    if simulation_app is not None:
+        simulation_app.close()
 
 
 if __name__ == "__main__":

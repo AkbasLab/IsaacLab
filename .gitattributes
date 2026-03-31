@@ -10,3 +10,6 @@
 *.pt filter=lfs diff=lfs merge=lfs -text
 *.jit filter=lfs diff=lfs merge=lfs -text
 *.hdf5 filter=lfs diff=lfs merge=lfs -text
+source/isaaclab_tasks/isaaclab_tasks/direct/crazyflie_l2f/checkpoints_pointnav/ppo/ filter=lfs diff=lfs merge=lfs -text
+source/isaaclab_tasks/isaaclab_tasks/direct/crazyflie_l2f/checkpoints_pointnav/sac/ filter=lfs diff=lfs merge=lfs -text
+source/isaaclab_tasks/isaaclab_tasks/direct/crazyflie_l2f/checkpoints_pointnav/td3/ filter=lfs diff=lfs merge=lfs -text
