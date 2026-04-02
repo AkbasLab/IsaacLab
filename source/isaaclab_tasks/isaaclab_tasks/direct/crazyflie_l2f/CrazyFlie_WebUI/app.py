@@ -69,6 +69,7 @@ PLAN_HOLD_USE_PLAN_Z = True
 CONNECT_LOG_PERIOD_MS = 100  # gentler startup period during connection/log setup
 LOG_PERIOD_MS = 10  # normal runtime period after the link is established
 LOG_PERIOD_SWITCH_DELAY_S = 1.0
+DISCONNECT_WAIT_S = 1.5
 
 # Telemetry broadcast rate (server -> UI)
 TELEM_PUMP_HZ = 20.0
@@ -167,6 +168,8 @@ class ControlState:
 
     # Internal / objects
     cf: Optional[Crazyflie] = None
+    disconnecting: bool = False
+    link_down_event: threading.Event = field(default_factory=threading.Event)
     logcfgs: List[LogConfig] = field(default_factory=list)
     send_thread: Optional[threading.Thread] = None
     send_thread_stop: threading.Event = field(default_factory=threading.Event)
@@ -188,7 +191,9 @@ def _clear_telemetry_state() -> None:
 
 
 def _mark_link_down(reason: str = "") -> None:
+    # Ensure callbacks and manual disconnect converge to one final state.
     STATE.connected = False
+    STATE.disconnecting = False
     STATE.cf = None
     STATE.mode = "idle"
     STATE.phase = "idle"
@@ -197,10 +202,12 @@ def _mark_link_down(reason: str = "") -> None:
     STATE.plan_started_at = 0.0
     STATE.plan_hold_until = 0.0
     STATE.plan_hold_target = None
+    STATE.link_down_event.set()
     _clear_telemetry_state()
 
 
 STATE = ControlState()
+STATE_LOCK = threading.RLock()
 
 # WebSocket clients (support multiple dashboards)
 CLIENTS: set[WebSocket] = set()
@@ -659,10 +666,12 @@ def _connect_blocking(uri: str) -> None:
 
     def _on_lost(_uri, msg):
         err["msg"] = f"link lost: {msg}"
-        _mark_link_down(err["msg"])
+        with STATE_LOCK:
+            _mark_link_down(err["msg"])
 
     def _on_disconnected(_uri):
-        _mark_link_down("disconnected")
+        with STATE_LOCK:
+            _mark_link_down("disconnected")
 
     cf.connected.add_callback(_on_connected)
     cf.connection_failed.add_callback(_on_failed)
@@ -695,16 +704,31 @@ def _connect_blocking(uri: str) -> None:
 
     _setup_logging(cf, period_ms=CONNECT_LOG_PERIOD_MS, include_optional=False)
 
-    STATE.cf = cf
-    STATE.connected = True
-    STATE.uri = uri
+    with STATE_LOCK:
+        STATE.link_down_event.clear()
+        STATE.disconnecting = False
+        STATE.cf = cf
+        STATE.connected = True
+        STATE.uri = uri
     _promote_logging_period_after_connect(cf)
 
 
 def _disconnect_blocking() -> None:
-    cf = STATE.cf
-    if not cf:
-        return
+    with STATE_LOCK:
+        cf = STATE.cf
+        if not cf:
+            return
+        # Stop outgoing setpoints immediately before touching the link.
+        STATE.connected = False
+        STATE.disconnecting = True
+        STATE.deadman_enabled = False
+        STATE.mode = "idle"
+        STATE.phase = "disconnecting"
+        STATE.plan_active = False
+        STATE.plan_hold_target = None
+        STATE.plan_hold_until = 0.0
+        STATE.plan_started_at = 0.0
+        STATE.link_down_event.clear()
 
     try:
         _safe_send_stop(cf)
@@ -716,12 +740,20 @@ def _disconnect_blocking() -> None:
     except Exception:
         pass
 
+    close_error: Optional[Exception] = None
     try:
         cf.close_link()
-    except Exception:
-        pass
+    except Exception as e:
+        close_error = e
 
-    _mark_link_down("manual disconnect")
+    # Prefer the cflib callback path, but guarantee final cleanup.
+    STATE.link_down_event.wait(timeout=DISCONNECT_WAIT_S)
+    with STATE_LOCK:
+        if STATE.cf is cf or STATE.disconnecting:
+            _mark_link_down("manual disconnect")
+
+    if close_error is not None:
+        raise RuntimeError(f"close_link failed: {close_error}")
 
 
 # ----------------------------
@@ -1111,9 +1143,13 @@ async def ws_endpoint(websocket: WebSocket):
                     await ws_log("Disconnect requested but already disconnected", "warn")
                     continue
                 await ws_log("Disconnecting...")
-                await asyncio.to_thread(_disconnect_blocking)
-                await ws_status("disconnected")
-                await ws_log("Disconnected", "warn")
+                try:
+                    await asyncio.to_thread(_disconnect_blocking)
+                    await ws_status("disconnected")
+                    await ws_log("Disconnected", "warn")
+                except Exception as e:
+                    await ws_status(f"disconnect error: {e}")
+                    await ws_log(f"Disconnect error: {e}", "error")
 
             elif mtype == "stop":
                 STATE.deadman_enabled = False
