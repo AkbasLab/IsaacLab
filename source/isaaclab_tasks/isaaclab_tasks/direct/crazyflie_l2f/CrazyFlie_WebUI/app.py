@@ -36,6 +36,7 @@ import asyncio
 import csv
 import io
 import json
+import logging
 import os
 import threading
 import time
@@ -47,9 +48,19 @@ from typing import Any, Dict, List, Optional, Tuple
 import cflib.crtp
 from cflib.crazyflie import Crazyflie
 from cflib.crazyflie.log import LogConfig
+from cflib.drivers.crazyradio import Crazyradio
+from cflib.crtp.radiodriver import RadioDriver
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import HTMLResponse, Response
+
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=os.getenv("CF_WEBUI_LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s | %(levelname)-8s | %(threadName)s | %(message)s",
+    )
+
+LOGGER = logging.getLogger("crazyflie_webui")
 
 # ----------------------------
 # Config
@@ -70,6 +81,9 @@ CONNECT_LOG_PERIOD_MS = 100  # gentler startup period during connection/log setu
 LOG_PERIOD_MS = 10  # normal runtime period after the link is established
 LOG_PERIOD_SWITCH_DELAY_S = 1.0
 DISCONNECT_WAIT_S = 1.5
+CONNECT_TIMEOUT_S = 10.0
+CONNECT_ATTEMPTS = 3
+CONNECT_RETRY_DELAY_S = 0.75
 
 # Telemetry broadcast rate (server -> UI)
 TELEM_PUMP_HZ = 20.0
@@ -136,6 +150,7 @@ class Waypoint:
 class ControlState:
     connected: bool = False
     uri: str = DEFAULT_URI
+    last_link_reason: str = ""
 
     # Modes
     mode: str = "idle"  # "idle" | "hover" | "navigate" | "plan"
@@ -156,6 +171,7 @@ class ControlState:
     plan: List[Waypoint] = field(default_factory=list)
     plan_loop: bool = True
     plan_active: bool = False
+    plan_start_delay_s: float = PLAN_HOLD_BEFORE_S
 
     # Plan timing & initial hold (ONE-SHOT)
     plan_started_at: float = 0.0
@@ -171,6 +187,7 @@ class ControlState:
     disconnecting: bool = False
     link_down_event: threading.Event = field(default_factory=threading.Event)
     logcfgs: List[LogConfig] = field(default_factory=list)
+    log_owner_id: Optional[int] = None
     send_thread: Optional[threading.Thread] = None
     send_thread_stop: threading.Event = field(default_factory=threading.Event)
 
@@ -192,6 +209,8 @@ def _clear_telemetry_state() -> None:
 
 def _mark_link_down(reason: str = "") -> None:
     # Ensure callbacks and manual disconnect converge to one final state.
+    if reason:
+        STATE.last_link_reason = reason
     STATE.connected = False
     STATE.disconnecting = False
     STATE.cf = None
@@ -202,6 +221,9 @@ def _mark_link_down(reason: str = "") -> None:
     STATE.plan_started_at = 0.0
     STATE.plan_hold_until = 0.0
     STATE.plan_hold_target = None
+    STATE.plan_start_delay_s = PLAN_HOLD_BEFORE_S
+    STATE.log_owner_id = None
+    STATE.logcfgs = []
     STATE.link_down_event.set()
     _clear_telemetry_state()
 
@@ -215,10 +237,126 @@ CLIENTS_LOCK = asyncio.Lock()
 
 # Telemetry pump task handle
 TELEM_TASK: Optional[asyncio.Task] = None
+DRIVER_INIT_LOCK = threading.Lock()
+DRIVERS_INITIALIZED = False
 
 # ----------------------------
 # Utilities
 # ----------------------------
+def _cf_label(cf: Optional[Crazyflie]) -> str:
+    if cf is None:
+        return "cf=None"
+    return f"cf@0x{id(cf):x}"
+
+
+def _state_snapshot() -> str:
+    with STATE_LOCK:
+        return (
+            f"active={_cf_label(STATE.cf)} connected={STATE.connected} "
+            f"disconnecting={STATE.disconnecting} mode={STATE.mode} "
+            f"phase={STATE.phase} log_owner="
+            f"{f'0x{STATE.log_owner_id:x}' if STATE.log_owner_id is not None else 'None'} "
+            f"last_reason={STATE.last_link_reason or '-'}"
+        )
+
+
+def _log_state(prefix: str, level: int = logging.INFO) -> None:
+    LOGGER.log(level, "%s | %s", prefix, _state_snapshot())
+
+
+def _init_cflib_drivers_once() -> None:
+    global DRIVERS_INITIALIZED
+    with DRIVER_INIT_LOCK:
+        if DRIVERS_INITIALIZED:
+            return
+        cflib.crtp.init_drivers(enable_debug_driver=False)
+        DRIVERS_INITIALIZED = True
+        LOGGER.info(
+            "Initialized cflib drivers: %s",
+            [cls.__name__ for cls in cflib.crtp.CLASSES],
+        )
+
+
+def _radio_datarate_label(datarate: int) -> str:
+    if datarate == Crazyradio.DR_250KPS:
+        return "250K"
+    if datarate == Crazyradio.DR_1MPS:
+        return "1M"
+    if datarate == Crazyradio.DR_2MPS:
+        return "2M"
+    return str(datarate)
+
+
+def _radio_address_to_int(address: Tuple[int, ...]) -> int:
+    value = 0
+    for idx, byte in enumerate(address):
+        value |= (int(byte) & 0xFF) << (8 * idx)
+    return value
+
+
+def _radio_preflight(uri: str, full_scan: bool = False) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "ok": False,
+        "exact_match": False,
+        "found": [],
+        "error": "",
+    }
+    try:
+        _init_cflib_drivers_once()
+        probe = RadioDriver()
+        devid, channel, datarate, address, _ = probe.parse_uri(uri)
+        radio = None
+        try:
+            from cflib.crtp.radiodriver import RadioManager
+
+            radio = RadioManager.open(devid)
+            probe._radio = radio
+            exact_found = list(probe.scan_selected([uri]))
+            result["exact_match"] = uri in exact_found
+            result["ok"] = result["exact_match"]
+            result["found"] = exact_found
+            LOGGER.info(
+                "Radio preflight for %s: exact_match=%s channel=%s datarate=%s",
+                uri,
+                result["exact_match"],
+                channel,
+                _radio_datarate_label(datarate),
+            )
+
+            if full_scan and not result["exact_match"]:
+                discovered = probe.scan_interface(_radio_address_to_int(address))
+                uris = [item[0] for item in discovered]
+                result["found"] = uris
+                LOGGER.warning(
+                    "Radio full scan for %s found %d candidate(s): %s",
+                    uri,
+                    len(uris),
+                    uris[:10],
+                )
+        finally:
+            if radio is not None and getattr(probe, "_radio", None) is radio:
+                try:
+                    radio.close()
+                except Exception:
+                    LOGGER.exception("Failed to close radio preflight handle for %s", uri)
+    except Exception as exc:
+        result["error"] = str(exc)
+        LOGGER.exception("Radio preflight failed for %s", uri)
+    return result
+
+
+def _scan_available_uris() -> List[str]:
+    try:
+        _init_cflib_drivers_once()
+        available = cflib.crtp.scan_interfaces()
+        uris = [item[0] for item in available]
+        LOGGER.info("scan_interfaces discovered %d URI(s): %s", len(uris), uris[:10])
+        return uris
+    except Exception:
+        LOGGER.exception("scan_interfaces failed")
+        return []
+
+
 def now_s() -> float:
     return time.time()
 
@@ -452,16 +590,29 @@ def _plan_sample_at(plan: List[Waypoint], t_now: float) -> Waypoint:
 # Crazyflie connection & telemetry
 # ----------------------------
 def _stop_logcfgs(cf: Crazyflie) -> None:
-    for lc in list(STATE.logcfgs):
+    cf_id = id(cf)
+    with STATE_LOCK:
+        if STATE.log_owner_id != cf_id:
+            LOGGER.debug(
+                "Skipping log config stop for %s because log owner is %s",
+                _cf_label(cf),
+                f"0x{STATE.log_owner_id:x}" if STATE.log_owner_id is not None else "None",
+            )
+            return
+        logcfgs = list(STATE.logcfgs)
+        STATE.logcfgs = []
+        STATE.log_owner_id = None
+
+    LOGGER.info("Stopping %d log configs for %s", len(logcfgs), _cf_label(cf))
+    for lc in logcfgs:
         try:
             lc.stop()
         except Exception:
-            pass
+            LOGGER.exception("Failed to stop log config %s on %s", lc.name, _cf_label(cf))
         try:
             cf.log.remove_config(lc)
         except Exception:
-            pass
-    STATE.logcfgs = []
+            LOGGER.exception("Failed to remove log config %s from %s", lc.name, _cf_label(cf))
 
 
 def _try_start_logcfg(cf: Crazyflie, lc: LogConfig, note: str) -> bool:
@@ -474,12 +625,20 @@ def _try_start_logcfg(cf: Crazyflie, lc: LogConfig, note: str) -> bool:
         lc.start()
         STATE.logcfgs.append(lc)
         STATE.log_notes.append(note)
+        LOGGER.info("Started log config %s on %s (%s)", lc.name, _cf_label(cf), note)
         return True
-    except Exception:
+    except Exception as exc:
         try:
             cf.log.remove_config(lc)
         except Exception:
             pass
+        LOGGER.info(
+            "Skipped log config %s on %s (%s): %s",
+            lc.name,
+            _cf_label(cf),
+            note,
+            exc,
+        )
         return False
 
 
@@ -496,7 +655,16 @@ def _setup_logging(cf: Crazyflie, period_ms: int = LOG_PERIOD_MS, include_option
       mag.* (if present)
     """
     _stop_logcfgs(cf)
+    with STATE_LOCK:
+        STATE.logcfgs = []
+        STATE.log_owner_id = id(cf)
     STATE.log_notes = []
+    LOGGER.info(
+        "Configuring logging for %s at %d ms (include_optional=%s)",
+        _cf_label(cf),
+        period_ms,
+        include_optional,
+    )
 
     def _log_cb(_timestamp, data, _logconf):
         # Runs in CF logging thread; do NOT call asyncio here.
@@ -640,38 +808,85 @@ def _promote_logging_period_after_connect(cf: Crazyflie) -> None:
     def _worker():
         time.sleep(LOG_PERIOD_SWITCH_DELAY_S)
         if STATE.cf is not cf or not STATE.connected:
+            LOGGER.info(
+                "Skipping log period promotion for %s because link is no longer current/connected",
+                _cf_label(cf),
+            )
             return
         try:
             _setup_logging(cf, period_ms=LOG_PERIOD_MS, include_optional=True)
+            LOGGER.info("Promoted %s logging period to %d ms", _cf_label(cf), LOG_PERIOD_MS)
         except Exception:
             # Keep the startup-safe logging period if reconfiguration fails.
-            pass
+            LOGGER.exception("Failed to promote logging period for %s", _cf_label(cf))
 
     threading.Thread(target=_worker, daemon=True).start()
 
 
-def _connect_blocking(uri: str) -> None:
-    cflib.crtp.init_drivers(enable_debug_driver=False)
+def _close_link_background(cf: Crazyflie, reason: str) -> None:
+    def _worker():
+        LOGGER.info("Background close_link starting for %s (%s)", _cf_label(cf), reason)
+        try:
+            cf.close_link()
+            LOGGER.info("Background close_link finished for %s", _cf_label(cf))
+        except Exception:
+            LOGGER.exception("Background close_link failed for %s", _cf_label(cf))
 
+    threading.Thread(
+        target=_worker,
+        daemon=True,
+        name=f"cf-close-{id(cf):x}",
+    ).start()
+
+
+def _connect_once_blocking(uri: str, attempt_idx: int, attempt_count: int) -> None:
     cf = Crazyflie(rw_cache="./cache")
     evt = threading.Event()
     err: Dict[str, str] = {"msg": ""}
+    LOGGER.info(
+        "Created Crazyflie handle %s for uri=%s (attempt %d/%d)",
+        _cf_label(cf),
+        uri,
+        attempt_idx,
+        attempt_count,
+    )
 
     def _on_connected(_uri):
+        LOGGER.info("Connected callback for %s uri=%s", _cf_label(cf), _uri)
         evt.set()
 
     def _on_failed(_uri, msg):
         err["msg"] = f"connect failed: {msg}"
+        LOGGER.warning("Connection failed callback for %s uri=%s msg=%s", _cf_label(cf), _uri, msg)
         evt.set()
 
     def _on_lost(_uri, msg):
         err["msg"] = f"link lost: {msg}"
+        LOGGER.warning("Connection lost callback for %s uri=%s msg=%s", _cf_label(cf), _uri, msg)
         with STATE_LOCK:
-            _mark_link_down(err["msg"])
+            if STATE.cf is cf:
+                try:
+                    _stop_logcfgs(cf)
+                except Exception:
+                    LOGGER.exception("Failed stopping log configs after connection_lost for %s", _cf_label(cf))
+                _mark_link_down(err["msg"])
+                _log_state(f"Marked current link down from connection_lost for {_cf_label(cf)}", logging.WARNING)
+            else:
+                _log_state(f"Ignored stale connection_lost for {_cf_label(cf)}", logging.INFO)
+        _close_link_background(cf, err["msg"])
 
     def _on_disconnected(_uri):
+        LOGGER.info("Disconnected callback for %s uri=%s", _cf_label(cf), _uri)
         with STATE_LOCK:
-            _mark_link_down("disconnected")
+            if STATE.cf is cf:
+                try:
+                    _stop_logcfgs(cf)
+                except Exception:
+                    LOGGER.exception("Failed stopping log configs after disconnected for %s", _cf_label(cf))
+                _mark_link_down("disconnected")
+                _log_state(f"Marked current link down from disconnected for {_cf_label(cf)}", logging.INFO)
+            else:
+                _log_state(f"Ignored stale disconnected callback for {_cf_label(cf)}", logging.INFO)
 
     cf.connected.add_callback(_on_connected)
     cf.connection_failed.add_callback(_on_failed)
@@ -681,20 +896,29 @@ def _connect_blocking(uri: str) -> None:
     except Exception:
         pass
 
+    LOGGER.info(
+        "Calling open_link on %s for uri=%s (attempt %d/%d)",
+        _cf_label(cf),
+        uri,
+        attempt_idx,
+        attempt_count,
+    )
     cf.open_link(uri)
 
-    if not evt.wait(timeout=10.0):
+    if not evt.wait(timeout=CONNECT_TIMEOUT_S):
+        LOGGER.error("Connect timeout waiting for %s", _cf_label(cf))
         try:
             cf.close_link()
         except Exception:
-            pass
+            LOGGER.exception("Failed to close %s after connect timeout", _cf_label(cf))
         raise RuntimeError("connect timeout")
 
     if err["msg"]:
+        LOGGER.error("Connect attempt failed for %s: %s", _cf_label(cf), err["msg"])
         try:
             cf.close_link()
         except Exception:
-            pass
+            LOGGER.exception("Failed to close %s after connect failure", _cf_label(cf))
         raise RuntimeError(err["msg"])
 
     _safe_send_stop(cf)
@@ -710,13 +934,84 @@ def _connect_blocking(uri: str) -> None:
         STATE.cf = cf
         STATE.connected = True
         STATE.uri = uri
+        STATE.last_link_reason = ""
+    _log_state(f"Connect complete for {_cf_label(cf)}")
     _promote_logging_period_after_connect(cf)
 
 
+def _connect_blocking(uri: str) -> None:
+    LOGGER.info("Beginning connect attempt to %s", uri)
+    _log_state("Pre-connect state")
+    _init_cflib_drivers_once()
+    selected_uri = uri
+
+    preflight = _radio_preflight(selected_uri, full_scan=False)
+    if preflight["error"]:
+        LOGGER.warning("Radio preflight error before connect to %s: %s", selected_uri, preflight["error"])
+    elif not preflight["exact_match"]:
+        LOGGER.warning(
+            "Radio preflight did not confirm URI %s before connect; trying discovery",
+            selected_uri,
+        )
+        discovered = _scan_available_uris()
+        if len(discovered) == 1:
+            LOGGER.warning(
+                "Falling back from requested URI %s to discovered URI %s",
+                selected_uri,
+                discovered[0],
+            )
+            selected_uri = discovered[0]
+        elif len(discovered) > 1:
+            LOGGER.warning(
+                "Multiple discoverable Crazyflie URIs found while %s was requested: %s",
+                selected_uri,
+                discovered[:10],
+            )
+
+    last_exc: Optional[Exception] = None
+    for attempt_idx in range(1, CONNECT_ATTEMPTS + 1):
+        try:
+            _connect_once_blocking(selected_uri, attempt_idx, CONNECT_ATTEMPTS)
+            return
+        except Exception as exc:
+            last_exc = exc
+            LOGGER.error(
+                "Connect attempt %d/%d failed for %s: %s",
+                attempt_idx,
+                CONNECT_ATTEMPTS,
+                selected_uri,
+                exc,
+            )
+            if attempt_idx < CONNECT_ATTEMPTS:
+                scan = _radio_preflight(selected_uri, full_scan=True)
+                if scan["found"]:
+                    LOGGER.warning(
+                        "Retrying connect to %s after failed attempt; radio scan candidates=%s",
+                        selected_uri,
+                        scan["found"][:10],
+                    )
+                else:
+                    discovered = _scan_available_uris()
+                    if len(discovered) == 1 and discovered[0] != selected_uri:
+                        LOGGER.warning(
+                            "Switching retry target from %s to discovered URI %s",
+                            selected_uri,
+                            discovered[0],
+                        )
+                        selected_uri = discovered[0]
+                time.sleep(CONNECT_RETRY_DELAY_S)
+
+    assert last_exc is not None
+    raise last_exc
+
+
 def _disconnect_blocking() -> None:
+    LOGGER.info("Beginning disconnect request")
+    _log_state("Pre-disconnect state")
     with STATE_LOCK:
         cf = STATE.cf
         if not cf:
+            LOGGER.info("Disconnect request ignored because there is no active Crazyflie handle")
             return
         # Stop outgoing setpoints immediately before touching the link.
         STATE.connected = False
@@ -729,28 +1024,38 @@ def _disconnect_blocking() -> None:
         STATE.plan_hold_until = 0.0
         STATE.plan_started_at = 0.0
         STATE.link_down_event.clear()
+        STATE.last_link_reason = "manual disconnect"
+    _log_state(f"Disconnect state primed for {_cf_label(cf)}")
 
     try:
         _safe_send_stop(cf)
     except Exception:
-        pass
+        LOGGER.exception("Failed to send stop before disconnect for %s", _cf_label(cf))
 
     try:
         _stop_logcfgs(cf)
     except Exception:
-        pass
+        LOGGER.exception("Failed while stopping log configs during disconnect for %s", _cf_label(cf))
 
     close_error: Optional[Exception] = None
     try:
+        LOGGER.info("Calling close_link on %s", _cf_label(cf))
         cf.close_link()
     except Exception as e:
         close_error = e
 
     # Prefer the cflib callback path, but guarantee final cleanup.
-    STATE.link_down_event.wait(timeout=DISCONNECT_WAIT_S)
+    link_down_seen = STATE.link_down_event.wait(timeout=DISCONNECT_WAIT_S)
+    LOGGER.info(
+        "Disconnect wait finished for %s (event_seen=%s timeout=%.2fs)",
+        _cf_label(cf),
+        link_down_seen,
+        DISCONNECT_WAIT_S,
+    )
     with STATE_LOCK:
         if STATE.cf is cf or STATE.disconnecting:
             _mark_link_down("manual disconnect")
+    _log_state(f"Disconnect finalised for {_cf_label(cf)}")
 
     if close_error is not None:
         raise RuntimeError(f"close_link failed: {close_error}")
@@ -760,6 +1065,8 @@ def _disconnect_blocking() -> None:
 # Send loop (50 Hz setpoints)
 # ----------------------------
 def _send_loop() -> None:
+    last_error_msg = ""
+    last_error_t = 0.0
     while not STATE.send_thread_stop.is_set():
         cf = STATE.cf
         if not cf or not STATE.connected:
@@ -823,7 +1130,7 @@ def _send_loop() -> None:
                             STATE.plan_hold_target = Waypoint(
                                 x=float(a.x), y=float(a.y), z=hold_z, yaw=hold_yaw, t=0.0
                             )
-                            STATE.plan_hold_until = tnow + float(PLAN_HOLD_BEFORE_S)
+                            STATE.plan_hold_until = tnow + float(STATE.plan_start_delay_s)
                             STATE.plan_started_at = STATE.plan_hold_until
                             STATE.phase = "plan(hold_start)"
                         else:
@@ -863,7 +1170,17 @@ def _send_loop() -> None:
                 STATE.phase = "idle"
                 cf.commander.send_stop_setpoint()
 
-        except Exception:
+        except Exception as exc:
+            msg = repr(exc)
+            if msg != last_error_msg or (now_s() - last_error_t) > 1.0:
+                LOGGER.exception(
+                    "Setpoint send loop error for %s while mode=%s phase=%s",
+                    _cf_label(cf),
+                    STATE.mode,
+                    STATE.phase,
+                )
+                last_error_msg = msg
+                last_error_t = now_s()
             try:
                 cf.commander.send_stop_setpoint()
             except Exception:
@@ -879,6 +1196,7 @@ def _ensure_send_thread() -> None:
     t = threading.Thread(target=_send_loop, daemon=True)
     STATE.send_thread = t
     t.start()
+    LOGGER.info("Started send loop thread %s", t.name)
 
 
 def _build_plots_zip_from_csv_text(csv_text: str) -> bytes:
@@ -1020,13 +1338,16 @@ def _load_plan_waypoints_from_csv(filename: str) -> List[Dict[str, float]]:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global TELEM_TASK
+    LOGGER.info("FastAPI lifespan startup")
     _ensure_send_thread()
     if TELEM_TASK is None or TELEM_TASK.done():
         TELEM_TASK = asyncio.create_task(telemetry_pump())
+        LOGGER.info("Started telemetry pump task")
 
     try:
         yield
     finally:
+        LOGGER.info("FastAPI lifespan shutdown")
         try:
             STATE.send_thread_stop.set()
         except Exception:
@@ -1043,7 +1364,7 @@ async def lifespan(_app: FastAPI):
         try:
             await asyncio.to_thread(_disconnect_blocking)
         except Exception:
-            pass
+            LOGGER.exception("Shutdown disconnect cleanup failed")
 
 
 app = FastAPI(title="Crazyflie Web UI Controller", lifespan=lifespan)
@@ -1081,6 +1402,9 @@ async def get_flightplan(name: str):
     plans = {
         "figure8_3d_eval": "figure8_eval_origin_3x_webui.csv",
     }
+    plan_start_delays_s = {
+        "figure8_3d_eval": 2.0,
+    }
     filename = plans.get(name)
     if filename is None:
         return Response(
@@ -1094,7 +1418,12 @@ async def get_flightplan(name: str):
     except Exception as e:
         return Response(content=json.dumps({"error": str(e)}), status_code=400, media_type="application/json")
 
-    return {"name": name, "loop": True, "waypoints": waypoints}
+    return {
+        "name": name,
+        "loop": True,
+        "start_delay_s": plan_start_delays_s.get(name, PLAN_HOLD_BEFORE_S),
+        "waypoints": waypoints,
+    }
 
 
 @app.websocket("/ws")
@@ -1102,6 +1431,8 @@ async def ws_endpoint(websocket: WebSocket):
     await websocket.accept()
     async with CLIENTS_LOCK:
         CLIENTS.add(websocket)
+        client_count = len(CLIENTS)
+    LOGGER.info("WebSocket client connected (clients=%d)", client_count)
 
     await ws_status("welcome")
     await ws_telemetry()
@@ -1116,6 +1447,7 @@ async def ws_endpoint(websocket: WebSocket):
                 continue
 
             mtype = msg.get("type")
+            LOGGER.info("WebSocket message received type=%s keys=%s", mtype, sorted(msg.keys()))
 
             if mtype == "connect":
                 uri = str(msg.get("uri") or DEFAULT_URI)
@@ -1138,7 +1470,7 @@ async def ws_endpoint(websocket: WebSocket):
                     await ws_log(f"Connect error: {e}", "error")
 
             elif mtype == "disconnect":
-                if not STATE.connected:
+                if not STATE.connected and STATE.cf is None:
                     await ws_status("already disconnected")
                     await ws_log("Disconnect requested but already disconnected", "warn")
                     continue
@@ -1213,6 +1545,7 @@ async def ws_endpoint(websocket: WebSocket):
                 if not wps:
                     STATE.plan = []
                     STATE.plan_active = False
+                    STATE.plan_start_delay_s = PLAN_HOLD_BEFORE_S
                     STATE.mode = "idle"
                     STATE.phase = "plan(empty)"
                     STATE.plan_hold_target = None
@@ -1225,6 +1558,7 @@ async def ws_endpoint(websocket: WebSocket):
                 STATE.plan = wps
                 STATE.plan_loop = loop
                 STATE.plan_active = False
+                STATE.plan_start_delay_s = float(msg.get("start_delay_s", PLAN_HOLD_BEFORE_S))
                 STATE.plan_started_at = 0.0
                 STATE.plan_hold_until = 0.0
                 STATE.plan_hold_target = None
@@ -1232,12 +1566,19 @@ async def ws_endpoint(websocket: WebSocket):
                 STATE.mode = "plan"
                 STATE.phase = "plan(loaded)"
 
-                await ws_status(f"plan loaded ({len(STATE.plan)} wps), loop={STATE.plan_loop}")
-                await ws_log(f"Plan loaded: {len(STATE.plan)} waypoints, loop={STATE.plan_loop}", "ok")
+                await ws_status(
+                    f"plan loaded ({len(STATE.plan)} wps), loop={STATE.plan_loop}, start_delay={STATE.plan_start_delay_s:.1f}s"
+                )
+                await ws_log(
+                    f"Plan loaded: {len(STATE.plan)} waypoints, loop={STATE.plan_loop}, start_delay={STATE.plan_start_delay_s:.1f}s",
+                    "ok",
+                )
 
     except WebSocketDisconnect:
         pass
     finally:
         async with CLIENTS_LOCK:
             CLIENTS.discard(websocket)
+            client_count = len(CLIENTS)
+        LOGGER.info("WebSocket client disconnected (clients=%d)", client_count)
         await ws_log("WebSocket client disconnected", "warn")
