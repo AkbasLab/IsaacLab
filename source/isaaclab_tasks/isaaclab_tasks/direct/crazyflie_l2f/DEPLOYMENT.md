@@ -1,175 +1,112 @@
 # Crazyflie Firmware Deployment Guide
 
-This guide covers deploying trained Isaac Lab hover policies to the physical Crazyflie 2.1 drone.
-
-**All files are self-contained within the IsaacLab crazyflie_l2f module.**
-
-## Directory Structure
-
-```
-crazyflie_l2f/
-├── checkpoints/
-│   └── best_model.pt          # Trained PPO policy
-├── firmware/
-│   └── actor_isaac_lab.h      # Exported C header (263 KB)
-├── build_firmware/
-│   └── cf2.bin                # Compiled firmware binary (419 KB)
-├── export_to_c_header.py      # Export checkpoint → C header
-├── train_hover.py             # Training script
-└── DEPLOYMENT.md              # This guide
-```
+This guide covers deploying trained Isaac Lab Crazyflie policies to a physical Crazyflie 2.1 drone.
 
 ## Pipeline Overview
 
-```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐     ┌────────────┐
-│  Train Policy   │ --> │  Export Header   │ --> │  Build Firmware │ --> │  Flash     │
-│  (train_hover)  │     │  (actor_*.h)     │     │  (cf2.bin)      │     │  (cfloader)│
-└─────────────────┘     └──────────────────┘     └─────────────────┘     └────────────┘
-```
+Train checkpoint (`.pt`) -> Export `actor.h` -> Build firmware (`cf2.bin`) -> Flash with `cfloader`
 
-## Step 1: Train Policy (Completed)
+## Standard Task-Local Firmware Flow
 
-Your policy has been trained with:
-- **Best reward**: 1.686 at iteration 597
-- **Architecture**: 146 → 64 → 64 → 4 (L2F compatible)
-- **Checkpoint**: `checkpoints/best_model.pt`
+This is the self-contained firmware path under `crazyflie_l2f/firmware`.
 
-## Step 2: Export to C Header (Completed)
+### Build with pre-exported `firmware/actor_isaac_lab.h`
 
-The checkpoint has been exported to:
-- **Header file**: `firmware/actor_isaac_lab.h` (263 KB)
-- **Format**: rl_tools Sequential module
-- **Normalization**: Baked into layer_0 weights
-
-## Step 3: Build Firmware
-
-### Prerequisites
-- Docker Desktop for Windows, OR
-- WSL2 with Docker installed
-
-### Using WSL + Docker (Windows)
-
-All outputs stay within the IsaacLab repository:
+From PowerShell on Windows:
 
 ```powershell
-# From PowerShell - build firmware with output in crazyflie_l2f/build_firmware/
-wsl -e bash -c 'docker run --rm \
-    -v "/mnt/d/coding/Capstone/learning-to-fly/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/direct/crazyflie_l2f/firmware/actor_isaac_lab.h:/controller/data/actor.h:ro" \
-    -v "/mnt/d/coding/Capstone/learning-to-fly/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/direct/crazyflie_l2f/build_firmware:/output" \
-    arpllab/learning_to_fly_build_firmware'
+wsl -e bash -lc "docker run --rm \
+  -v /mnt/d/coding/Capstone/learning-to-fly/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/direct/crazyflie_l2f/firmware/actor_isaac_lab.h:/controller/data/actor.h:ro \
+  -v /mnt/d/coding/Capstone/learning-to-fly/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/direct/crazyflie_l2f/build_firmware:/output \
+  arpllab/learning_to_fly_build_firmware"
 ```
 
-### Using Docker Directly (Linux/Mac)
+Expected output: `D:\coding\Capstone\learning-to-fly\IsaacLab\source\isaaclab_tasks\isaaclab_tasks\direct\crazyflie_l2f\build_firmware\cf2.bin`
 
-```bash
-# From the crazyflie_l2f directory
-docker run --rm \
-    -v "${PWD}/firmware/actor_isaac_lab.h:/controller/data/actor.h:ro" \
-    -v "${PWD}/build_firmware:/output" \
-    arpllab/learning_to_fly_build_firmware
-```
+## Custom 149-Dim Firmware Flow via `l2f_firmware_149`
 
-### Native Build (Linux/WSL)
+Use this path for the custom 149-dimensional pointnav / hold firmware variant in `D:\coding\Capstone\learning-to-fly\IsaacLab\l2f_firmware_149`.
 
-```bash
-# Clone the controller repository
-git clone https://github.com/arplaboratory/learning_to_fly_controller.git
-cd learning_to_fly_controller
-git submodule update --init --recursive
+This flow uses:
 
-# Copy your trained policy
-cp /path/to/actor_isaac_lab.h data/actor.h
+- the exported `actor.h`
+- the custom `rl_tools_adapter.cpp/.h`
+- the custom `rl_tools_controller.c`
+- the custom Dockerfile in `l2f_firmware_149`
 
-# Build
-make
-# Output: build/cf2.bin
-```
+### Exact commands in sequence
 
-## Step 4: Flash to Crazyflie
-
-### Prerequisites
-- Crazyradio PA USB dongle
-- cfclient installed: `pip install cfclient`
-
-### Flash Command
-
-```bash
-# Put Crazyflie in bootloader mode:
-# 1. Turn off the Crazyflie
-# 2. Hold power button for 3+ seconds
-# 3. Blue LEDs should blink
-
-# Flash the firmware (from crazyflie_l2f directory)
-cfloader flash build_firmware/cf2.bin stm32-fw -w radio://0/80/2M
-```
-
-### Alternative Radio URIs
-- `radio://0/80/2M` - Channel 80, 2Mbit (default)
-- `radio://0/80/250K` - Channel 80, 250Kbit (longer range)
-- `radio://0/60/2M` - Different channel
-
-## Step 5: Fly the Crazyflie
-
-### Using cfclient (with Gamepad)
-
-1. Launch cfclient: `cfclient`
-2. Connect to Crazyflie
-3. Use gamepad "hover button" as dead man's switch
-4. Default hover height: 0.3m above takeoff position
-
-### Using trigger.py (Safer)
-
-```bash
-# Take off with original controller, switch to learned policy
-python scripts/trigger.py --mode takeoff_and_switch --height 0.5
-
-# Hover with learned policy from takeoff
-python scripts/trigger.py --mode hover_learned --height 0.3
-
-# Trajectory tracking (figure-8)
-python scripts/trigger.py --mode trajectory_tracking --trajectory-scale 0.3
-```
-
-## Important Notes
-
-### Position Estimation
-The policy requires position estimation. Options:
-- **Flow Deck v2** - Optical flow + height sensor (recommended for hover)
-- **Lighthouse** - Sub-cm accuracy
-- **Loco Positioning** - UWB-based
-
-### Safety
-⚠️ **Flying with learned controllers is at your own risk!**
-
-- Always have a dead man's switch
-- Start with low heights (0.2-0.3m)
-- Use `takeoff_and_switch` mode first
-- Keep yaw angle near 0 at takeoff
-- Test in an open area away from obstacles
-
-### Troubleshooting
-
-| Issue | Solution |
-|-------|----------|
-| cfloader not found | `pip install cfclient` |
-| Radio not detected | Reinstall Crazyradio drivers |
-| Build fails | Check Docker is running |
-| Drone unstable | Try `takeoff_and_switch` mode |
-| Policy too aggressive | Reduce training iterations |
-
-## File Locations
-
-| File | Purpose |
-|------|---------|
-| `checkpoints/best_model.pt` | Trained PyTorch checkpoint |
-| `firmware/actor_isaac_lab.h` | Exported C header |
-| `build_firmware/cf2.bin` | Compiled firmware binary |
-| `deploy_to_crazyflie.ps1` | Deployment helper script |
-
-## Quick Deploy Script
+Run these commands from PowerShell:
 
 ```powershell
-# All-in-one deployment (requires Docker)
-.\deploy_to_crazyflie.ps1 -Build -Flash
+cd D:\coding\Capstone\learning-to-fly\IsaacLab
 ```
+
+```powershell
+python source\isaaclab_tasks\isaaclab_tasks\direct\crazyflie_l2f\export_policy_standalone.py `
+  "D:\coding\Capstone\learning-to-fly\IsaacLab\source\isaaclab_tasks\isaaclab_tasks\direct\crazyflie_l2f\checkpoints_hold_finetune_unified_motion_curriculum_export149_preservewarmstart_20260326_130156\best_model.pt" `
+  "D:\coding\Capstone\learning-to-fly\IsaacLab\l2f_firmware_149\data" `
+  --name hold_finetune_export149
+```
+
+That writes `D:\coding\Capstone\learning-to-fly\IsaacLab\l2f_firmware_149\data\actor.h`.
+
+Then build the Docker image inside WSL:
+
+```powershell
+wsl -e bash -lc "cd /mnt/d/coding/Capstone/learning-to-fly/IsaacLab/l2f_firmware_149 && docker build -t l2f-firmware-149 ."
+```
+
+Then run the image to produce `cf2.bin`:
+
+```powershell
+wsl -e bash -lc "mkdir -p /mnt/d/coding/Capstone/learning-to-fly/IsaacLab/l2f_firmware_149/build_firmware && cd /mnt/d/coding/Capstone/learning-to-fly/IsaacLab/l2f_firmware_149 && docker run --rm -v /mnt/d/coding/Capstone/learning-to-fly/IsaacLab/l2f_firmware_149/build_firmware:/output l2f-firmware-149"
+```
+
+Expected output: `D:\coding\Capstone\learning-to-fly\IsaacLab\l2f_firmware_149\build_firmware\cf2.bin`
+
+### What the two Docker commands do
+
+`docker build`:
+- reads `l2f_firmware_149/Dockerfile`
+- clones the controller repo and submodules into the image
+- copies in your custom firmware files
+- copies `data/actor.h` into the image
+- creates the image named `l2f-firmware-149`
+
+`docker run`:
+- starts a container from `l2f-firmware-149`
+- mounts `build_firmware` from your host into `/output`
+- runs `make`
+- copies `build/cf2.bin` to `/output/cf2.bin`
+
+Important note:
+
+- `l2f_firmware_149/Dockerfile` copies `data/actor.h` during `docker build`, not `docker run`
+- if you export a new checkpoint, you must run `docker build` again before `docker run`
+
+## Flash to Crazyflie
+
+Put Crazyflie into bootloader mode first:
+
+1. Turn the Crazyflie off.
+2. Hold the power button for 3+ seconds.
+3. Wait for the blue LEDs to blink.
+
+### Flash standard task-local firmware
+
+```powershell
+cfloader flash D:\coding\Capstone\learning-to-fly\IsaacLab\source\isaaclab_tasks\isaaclab_tasks\direct\crazyflie_l2f\build_firmware\cf2.bin stm32-fw -w radio://0/80/2M
+```
+
+### Flash custom `l2f_firmware_149` firmware
+
+```powershell
+cfloader flash D:\coding\Capstone\learning-to-fly\IsaacLab\l2f_firmware_149\build_firmware\cf2.bin stm32-fw -w radio://0/80/2M
+```
+
+## Notes
+
+- `cfloader` typically comes from `cfclient` / `crazyflie-clients-python`
+- default radio URI here is `radio://0/80/2M`
+- the custom `l2f_firmware_149` path expects `actor.h`, not `agent.h`
