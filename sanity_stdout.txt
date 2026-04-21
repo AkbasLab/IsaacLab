@@ -1,0 +1,64 @@
+[INFO] Using python from: D:\coding\Capstone\learning-to-fly\IsaacLab\\_isaac_sim\python.bat
+Loading user config located at: 'd:/coding/capstone/learning-to-fly/isaaclab/_isaac_sim/kit/data/Kit/Isaac-Sim/5.0/user.config.json'
+[Info] [carb] Logging to file: d:/coding/capstone/learning-to-fly/isaaclab/_isaac_sim/kit/logs/Kit/Isaac-Sim/5.0/kit_20260305_021225.log
+2026-03-05T07:12:26Z [395ms] [Warning] [omni.usd_config.extension] Enable omni.materialx.libs extension to use MaterialX
+2026-03-05T07:12:26Z [952ms] [Warning] [omni.isaac.dynamic_control] omni.isaac.dynamic_control is deprecated as of Isaac Sim 4.5. No action is needed from end-users.
+2026-03-05T07:12:29Z [3,499ms] [Warning] [gpu.foundation.plugin] Skipping unsupported non-NVIDIA GPU: AMD Radeon(TM) Graphics
+2026-03-05T07:12:29Z [3,499ms] [Warning] [gpu.foundation.plugin] Skipping unsupported non-NVIDIA GPU: AMD Radeon(TM) Graphics
+
+|---------------------------------------------------------------------------------------------|
+| Driver Version: 591.86        | Graphics API: D3D12
+|=============================================================================================|
+| GPU | Name                             | Active | LDA | GPU Memory | Vendor-ID | LUID       |
+|     |                                  |        |     |            | Device-ID | UUID       |
+|     |                                  |        |     |            | Bus-ID    |            |
+|---------------------------------------------------------------------------------------------|
+| 0   | NVIDIA GeForce RTX 4090          | Yes: 0 |     | 24138   MB | 10de      | 0f350100.. |
+|     |                                  |        |     |            | 2684      | 0          |
+|     |                                  |        |     |            | 1         |            |
+|---------------------------------------------------------------------------------------------|
+| 1   | AMD Radeon(TM) Graphics          |        |     | 2021    MB | 1002      | 724a0100.. |
+|     |                                  |        |     |            | 13c0      | 0          |
+|     |                                  |        |     |            | N/A       |            |
+|=============================================================================================|
+| OS: Windows 11 Pro, Version: 10.0 (25H2), Build: 26200, Kernel: 10.0.26100.7824
+| Processor: AMD Ryzen 7 9800X3D 8-Core Processor           
+| Cores: 8 | Logical Cores: 16
+|---------------------------------------------------------------------------------------------|
+| Total Memory (MB): 63081 | Free Memory: 40481
+| Total Page/Swap (MB): 108009 | Free Page/Swap: 66328
+|---------------------------------------------------------------------------------------------|
+2026-03-05T07:12:29Z [3,968ms] [Warning] [isaaclab.envs.direct_rl_env] Seed not set for the environment. The environment creation may not be deterministic.
+2026-03-05T07:12:30Z [4,401ms] [Warning] [carb.windowing-glfw.gamepad] Joystick with unknown remapping detected (will be ignored):  Keychron K10 HE [0300000034340000a00e000000000000]
+2026-03-05T07:12:30Z [5,136ms] [Warning] [gpu.foundation.plugin] Skipping unsupported non-NVIDIA GPU: AMD Radeon(TM) Graphics
+2026-03-05T07:12:30Z [5,137ms] [Warning] [gpu.foundation.plugin] Skipping unsupported non-NVIDIA GPU: AMD Radeon(TM) Graphics
+2026-03-05T07:12:30Z [5,139ms] [Warning] [carb.graphics-vulkan.plugin] Aftermath Error 0xbad00009
+
+|---------------------------------------------------------------------------------------------|
+| Driver Version: 591.86        | Graphics API: Vulkan
+|=============================================================================================|
+| GPU | Name                             | Active | LDA | GPU Memory | Vendor-ID | LUID       |
+|     |                                  |        |     |            | Device-ID | UUID       |
+|     |                                  |        |     |            | Bus-ID    |            |
+|---------------------------------------------------------------------------------------------|
+| 0   | NVIDIA GeForce RTX 4090          | Yes: 0 |     | 24138   MB | 10de      | 0f350100.. |
+|     |                                  |        |     |            | 2684      | c5c71e41.. |
+|     |                                  |        |     |            | 1         |            |
+|---------------------------------------------------------------------------------------------|
+| 1   | AMD Radeon(TM) Graphics          |        |     | 22477   MB | 1002      | 724a0100.. |
+|     |                                  |        |     |            | 13c0      | 00000000.. |
+|     |                                  |        |     |            | N/A       |            |
+|=============================================================================================|
+| OS: Windows 11 Pro, Version: 10.0 (25H2), Build: 26200, Kernel: 10.0.26100.7824
+| Processor: AMD Ryzen 7 9800X3D 8-Core Processor           
+| Cores: 8 | Logical Cores: 16
+|---------------------------------------------------------------------------------------------|
+| Total Memory (MB): 63081 | Free Memory: 40368
+| Total Page/Swap (MB): 108009 | Free Page/Swap: 66219
+|---------------------------------------------------------------------------------------------|
+2026-03-05T07:12:31Z [5,494ms] [Warning] [omni.graph.visualization.nodes._impl.extension] No Viewport Window to add omni.graph.visualization.nodes-2.1.3 scene to
+2026-03-05T07:12:31Z [5,603ms] [Warning] [isaacsim.asset.importer.urdf] link arm1 has no body properties (mass, inertia, or collisions) and is being merged into body
+2026-03-05T07:12:31Z [5,603ms] [Warning] [isaacsim.asset.importer.urdf] link arm2 has no body properties (mass, inertia, or collisions) and is being merged into body
+2026-03-05T07:12:31Z [5,603ms] [Warning] [isaacsim.asset.importer.urdf] link arm3 has no body properties (mass, inertia, or collisions) and is being merged into body
+2026-03-05T07:12:31Z [5,603ms] [Warning] [isaacsim.asset.importer.urdf] link arm4 has no body properties (mass, inertia, or collisions) and is being merged into body
+2026-03-05T07:12:32Z [6,629ms] [Warning] [omni.physx.fabric.plugin] FabricManager::initializePointInstancer mismatched prototypes on point instancer: /Visuals/Command/goal_position.

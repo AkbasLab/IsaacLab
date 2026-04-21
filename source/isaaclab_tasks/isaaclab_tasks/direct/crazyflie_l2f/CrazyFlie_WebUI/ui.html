@@ -85,11 +85,12 @@
         <button id="stopBtn" class="btn btn-danger">STOP</button>
 
         <div class="right row" style="gap:8px;">
-          <button id="clearXYBtn" class="btn btn-ghost">Clear XY Graph</button>
+          <button id="clearXYBtn" class="btn btn-ghost">Clear Flight Graph</button>
 
           <button id="logStartBtn" class="btn btn-ghost">Start Log</button>
           <button id="logStopBtn" class="btn btn-ghost">Stop Log</button>
           <button id="logDownloadBtn" class="btn btn-ghost">Download CSV</button>
+          <button id="logPlotsBtn" class="btn btn-ghost">Download Plots ZIP</button>
           <span class="badge mono">Log: <span id="logState">stopped</span></span>
 
           <label class="small muted" for="uriInput">URI</label>
@@ -108,10 +109,17 @@
         </div>
       </div>
 
+      <div class="tabs" style="margin-top:4px;">
+        <button id="tabGraph2d" class="tab active">2D Flight</button>
+        <button id="tabGraph3d" class="tab">3D Flight</button>
+      </div>
+
       <canvas id="xyCanvas" width="980" height="560" aria-label="XY plot"></canvas>
+      <canvas id="flight3dCanvas" width="980" height="560" aria-label="3D flight plot" style="display:none;"></canvas>
 
       <div class="small muted" style="margin-top:10px;">
-        XY plot uses meters → pixels mapping. Target is current commanded setpoint; Actual is from telemetry (stateEstimate).
+        <b>2D Flight:</b> top-down X/Y target vs actual telemetry.<br/>
+        <b>3D Flight:</b> X/Y/Z target vs actual telemetry. Left-drag rotates, Shift+drag (or right-drag) pans, mouse-wheel zooms, double-click resets view.
       </div>
     </section>
 
@@ -128,10 +136,13 @@
       <div class="tabs">
         <button id="tabDraw" class="tab active">Draw</button>
         <button id="tabPoints" class="tab">Points</button>
+        <button id="tab3d" class="tab">3D</button>
       </div>
 
       <div class="row" style="gap:10px; margin-bottom:10px;">
         <button id="presetFig8Btn" class="mini-btn">Preset: Figure 8</button>
+        <button id="presetFig83DBtn" class="mini-btn">Preset: 3D Figure 8</button>
+        <button id="presetCubeBtn" class="mini-btn">Preset: 3D Cube</button>
         <span class="badge mono">Points: <span id="ptCount">0</span></span>
         <span class="badge mono">Selected: <span id="selIdx">--</span></span>
         <span class="badge mono">Mode: <span id="fpMode">draw</span></span>
@@ -164,9 +175,31 @@
         </div>
       </div>
 
+      <div id="fp3dControls" class="grid" style="margin-top:10px; display:none;">
+        <div>
+          <label>Default New Point Z (m)</label>
+          <input id="pointZDefault" type="number" step="0.05" value="0.30"/>
+        </div>
+        <div>
+          <label>Selected Point X (m)</label>
+          <input id="selectedPointX" type="number" step="0.05" value="0.00"/>
+        </div>
+        <div>
+          <label>Selected Point Y (m)</label>
+          <input id="selectedPointY" type="number" step="0.05" value="0.00"/>
+        </div>
+        <div>
+          <label>Selected Point Z (m)</label>
+          <input id="selectedPointZ" type="number" step="0.05" value="0.30"/>
+        </div>
+      </div>
+
+      <canvas id="plan3dPreview" width="980" height="260" aria-label="3D flightplan preview" style="display:none; margin-top:10px;"></canvas>
+
       <div class="small muted" style="margin-top:10px;">
         <b>Draw tab:</b> click-drag to draw; points are auto-sampled & indexed.<br/>
-        <b>Points tab:</b> click to add numbered points, drag to move, click a point to select.
+        <b>Points tab:</b> click to add numbered points, drag to move, click a point to select, then fine-tune X/Y/Z in the point editor.<br/>
+        <b>3D tab:</b> place/move points in XY, set a different height per point, and use the preview below for the 3D path.
       </div>
     </section>
   </section>
@@ -469,14 +502,16 @@
 
   // ========= Canvas scaling + coordinates =========
   function fitCanvasToCSS(canvas){
-    const dpr = window.devicePixelRatio || 1;
     const r = canvas.getBoundingClientRect();
-    const w = Math.max(1, Math.round(r.width * dpr));
-    const h = Math.max(1, Math.round(r.height * dpr));
-    if(canvas.width !== w || canvas.height !== h){
+    if(r.width <= 0 || r.height <= 0) return false;
+    const w = Math.max(1, Math.round(r.width));
+    const h = Math.max(1, Math.round(r.height));
+    const changed = (canvas.width !== w || canvas.height !== h);
+    if(changed){
       canvas.width = w;
       canvas.height = h;
     }
+    return changed;
   }
 
   function canvasPos(e, canvas){
@@ -594,22 +629,51 @@
   // --------- XY Plot (origin-lock to start at 0,0) ---------
   const xyCanvas = el("xyCanvas");
   const xyCtx = xyCanvas.getContext("2d");
+  const flight3dCanvas = el("flight3dCanvas");
+  const flight3dCtx = flight3dCanvas.getContext("2d");
   const trailLenEl = el("trailLen");
+  const tabGraph2d = el("tabGraph2d");
+  const tabGraph3d = el("tabGraph3d");
   let trailTarget = [];
   let trailActual = [];
+  let trailTarget3d = [];
+  let trailActual3d = [];
+  let graphMode = "xy";
 
-  let graphOrigin = { x: 0, y: 0 };
+  let graphOrigin = { x: 0, y: 0, z: 0 };
   let graphOriginArmed = false;
   let graphOriginLocked = false;
 
   function clearXYTrails(){
     trailTarget = [];
     trailActual = [];
-    drawGrid(xyCtx, xyCanvas);
+    trailTarget3d = [];
+    trailActual3d = [];
+    renderFlightGraph();
   }
 
   const clearXYBtn = document.getElementById("clearXYBtn");
-  if(clearXYBtn) clearXYBtn.onclick = () => { clearXYTrails(); addConsoleLine("XY graph cleared", "warn", new Date().toLocaleTimeString()); };
+  if(clearXYBtn) clearXYBtn.onclick = () => { clearXYTrails(); addConsoleLine("Flight graph cleared", "warn", new Date().toLocaleTimeString()); };
+  const resetOriginBtn = document.getElementById("resetOriginBtn");
+  if(resetOriginBtn) resetOriginBtn.onclick = () => {
+    if(lastTelem && lastTelem.actual && lastTelem.actual.x != null && lastTelem.actual.y != null){
+      graphOrigin = {
+        x: Number(lastTelem.actual.x) || 0,
+        y: Number(lastTelem.actual.y) || 0,
+        z: (lastTelem.actual.z != null ? (Number(lastTelem.actual.z) || 0) : 0)
+      };
+      graphOriginLocked = true;
+      graphOriginArmed = false;
+      clearXYTrails();
+      addConsoleLine(`Graph origin reset to current position x=${graphOrigin.x.toFixed(2)}, y=${graphOrigin.y.toFixed(2)}, z=${graphOrigin.z.toFixed(2)}`, "ok", new Date().toLocaleTimeString());
+    }else{
+      graphOrigin = { x: 0, y: 0, z: 0 };
+      graphOriginArmed = true;
+      graphOriginLocked = false;
+      clearXYTrails();
+      addConsoleLine("No telemetry yet; graph origin will reset on next telemetry sample", "warn", new Date().toLocaleTimeString());
+    }
+  };
 
   function m2p(canvas, mx, my, mpg = metersPerGrid){
     const cx = canvas.width/2, cy = canvas.height/2;
@@ -633,12 +697,304 @@
     ctx.beginPath(); ctx.arc(p.x, p.y, 9, 0, Math.PI*2); ctx.stroke();
   }
 
+  const view3D = { panX: 0, panY: 0, zoom: 0.82, yaw: 0.785398163, tilt: 0.58 };
+  let drag3D = { active: false, x: 0, y: 0, mode: 'rotate' };
+
+  function project3DRaw(mx, my, mz){
+    const yaw = view3D.yaw;
+    const cy = Math.cos(yaw), sy = Math.sin(yaw);
+    const xr = (mx * cy) - (my * sy);
+    const yr = (mx * sy) + (my * cy);
+    const tilt = view3D.tilt;
+    const u = (xr - yr) * 0.8660254;
+    const v = (xr + yr) * tilt + mz;
+    return { u, v };
+  }
+
+  function get3DProjectionState(canvas){
+    const all = [...trailTarget3d, ...trailActual3d];
+    const seed = all.length ? all : [{x:-0.8,y:-0.8,z:0},{x:0.8,y:0.8,z:0.8},{x:0,y:0,z:0}];
+
+    let minX = Infinity, maxX = -Infinity;
+    let minY = Infinity, maxY = -Infinity;
+    let minZ = Infinity, maxZ = -Infinity;
+
+    for(const p of seed){
+      const x = Number(p.x) || 0;
+      const y = Number(p.y) || 0;
+      const z = Number(p.z) || 0;
+      minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+      minY = Math.min(minY, y); maxY = Math.max(maxY, y);
+      minZ = Math.min(minZ, z); maxZ = Math.max(maxZ, z);
+    }
+
+    const span = Math.max(1.6, Math.abs(minX), Math.abs(maxX), Math.abs(minY), Math.abs(maxY)) + 0.6;
+    const zFloor = Math.min(0, minZ - 0.15);
+    const zTop = Math.max(1.2, maxZ + 0.6);
+
+    let minU = Infinity, maxU = -Infinity;
+    let minV = Infinity, maxV = -Infinity;
+    const boundsPts = [
+      [-span,-span,zFloor],[ span,-span,zFloor],[ span, span,zFloor],[-span, span,zFloor],
+      [-span,-span,zTop  ],[ span,-span,zTop  ],[ span, span,zTop  ],[-span, span,zTop  ],
+      [0,0,0],[1.0,0,0],[0,1.0,0],[0,0,1.0]
+    ];
+    for(const [x,y,z] of boundsPts){
+      const pr = project3DRaw(x, y, z);
+      minU = Math.min(minU, pr.u); maxU = Math.max(maxU, pr.u);
+      minV = Math.min(minV, pr.v); maxV = Math.max(maxV, pr.v);
+    }
+
+    const pad = Math.max(84, Math.min(canvas.width, canvas.height) * 0.18);
+    const uRange = Math.max(1.6, maxU - minU);
+    const vRange = Math.max(1.6, maxV - minV);
+    const baseScale = Math.min((canvas.width - pad * 2) / uRange, (canvas.height - pad * 2) / vRange);
+    const scale = Math.max(14, Math.min(120, baseScale)) * view3D.zoom;
+
+    const ox = canvas.width / 2 - ((minU + maxU) / 2) * scale + view3D.panX;
+    const oy = canvas.height / 2 + ((minV + maxV) / 2) * scale + view3D.panY;
+
+    return { scale, ox, oy, minX, maxX, minY, maxY, minZ, maxZ, span, zFloor, zTop };
+  }
+
+  function project3DPoint(canvas, mx, my, mz, state = null){
+    const s = state || get3DProjectionState(canvas);
+    const pr = project3DRaw(mx, my, mz);
+    return { x: s.ox + pr.u * s.scale, y: s.oy - pr.v * s.scale };
+  }
+
+  function draw3DBackground(ctx, canvas, state){
+    const w = canvas.width, h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+
+    const g = ctx.createLinearGradient(0, 0, 0, h);
+    g.addColorStop(0, '#09122a');
+    g.addColorStop(1, '#0b1030');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, w, h);
+
+    const span = state.span;
+    const zTop = state.zTop;
+    const step = Math.max(0.25, Math.round((span / 8) * 100) / 100);
+
+    ctx.strokeStyle = 'rgba(110,231,255,.08)';
+    ctx.lineWidth = 1;
+    for(let y = -span; y <= span + 1e-6; y += step){
+      const a = project3DPoint(canvas, -span, y, 0, state);
+      const b = project3DPoint(canvas,  span, y, 0, state);
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    }
+    for(let x = -span; x <= span + 1e-6; x += step){
+      const a = project3DPoint(canvas, x, -span, 0, state);
+      const b = project3DPoint(canvas, x,  span, 0, state);
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    }
+
+    const boxPts = [
+      [-span,-span,0],[ span,-span,0],[ span, span,0],[-span, span,0],
+      [-span,-span,zTop],[ span,-span,zTop],[ span, span,zTop],[-span, span,zTop]
+    ].map(v => project3DPoint(canvas, v[0], v[1], v[2], state));
+    const edges = [[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]];
+    ctx.strokeStyle = 'rgba(201,208,255,.14)';
+    for(const [a,b] of edges){
+      ctx.beginPath();
+      ctx.moveTo(boxPts[a].x, boxPts[a].y);
+      ctx.lineTo(boxPts[b].x, boxPts[b].y);
+      ctx.stroke();
+    }
+  }
+
+  function draw3DReference(ctx, canvas, state){
+    const origin = project3DPoint(canvas, 0, 0, 0, state);
+    const axes = [
+      {to:[0.8,0,0], label:'X', dx:10, dy:0, color:'rgba(52,211,153,.55)'},
+      {to:[0,0.8,0], label:'Y', dx:-14, dy:0, color:'rgba(110,231,255,.55)'},
+      {to:[0,0,0.8], label:'Z', dx:8, dy:-10, color:'rgba(245,158,11,.7)'},
+    ];
+
+    ctx.font = '12px ui-monospace, Menlo, Consolas, monospace';
+    ctx.fillStyle = 'rgba(233,236,255,.9)';
+    ctx.lineWidth = 2;
+    for(const axis of axes){
+      const p = project3DPoint(canvas, axis.to[0], axis.to[1], axis.to[2], state);
+      ctx.strokeStyle = axis.color;
+      ctx.beginPath();
+      ctx.moveTo(origin.x, origin.y);
+      ctx.lineTo(p.x, p.y);
+      ctx.stroke();
+      ctx.fillText(axis.label, p.x + axis.dx, p.y + axis.dy);
+    }
+
+    ctx.fillStyle = 'rgba(233,236,255,.7)';
+    ctx.fillText('Origin', origin.x + 8, origin.y - 8);
+  }
+
+  function drawTrail3D(ctx, canvas, points, color, state){
+    if(points.length < 2) return;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    const p0 = project3DPoint(canvas, points[0].x, points[0].y, points[0].z, state);
+    ctx.moveTo(p0.x, p0.y);
+    for(let i=1;i<points.length;i++){
+      const p = project3DPoint(canvas, points[i].x, points[i].y, points[i].z, state);
+      ctx.lineTo(p.x, p.y);
+    }
+    ctx.stroke();
+  }
+
+  function drawDot3D(ctx, canvas, point, color, state, radius=5){
+    const p = project3DPoint(canvas, point.x, point.y, point.z, state);
+    const shadow = project3DPoint(canvas, point.x, point.y, 0, state);
+
+    ctx.strokeStyle = 'rgba(255,255,255,.12)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(shadow.x, shadow.y);
+    ctx.lineTo(p.x, p.y);
+    ctx.stroke();
+
+    ctx.fillStyle = 'rgba(255,255,255,.08)';
+    ctx.beginPath();
+    ctx.arc(shadow.x, shadow.y, Math.max(2, radius - 2), 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,.25)';
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, radius + 4, 0, Math.PI * 2);
+    ctx.stroke();
+    return p;
+  }
+
+  function renderFlightGraph(){
+    if(graphMode === "xy"){
+      xyCanvas.style.display = 'block';
+      flight3dCanvas.style.display = 'none';
+      drawGrid(xyCtx, xyCanvas);
+      drawTrail(xyCtx, trailTarget, '#34d399');
+      drawTrail(xyCtx, trailActual, '#f472b6');
+      const tp = trailTarget[trailTarget.length - 1];
+      const ap = trailActual[trailActual.length - 1];
+      if(tp) drawDot(xyCtx, tp, '#34d399');
+      if(ap) drawDot(xyCtx, ap, '#f472b6');
+      if(tp && ap){
+        xyCtx.strokeStyle = '#f59e0b'; xyCtx.lineWidth = 2;
+        xyCtx.beginPath(); xyCtx.moveTo(ap.x, ap.y); xyCtx.lineTo(tp.x, tp.y); xyCtx.stroke();
+      }
+      return;
+    }
+
+    xyCanvas.style.display = 'none';
+    flight3dCanvas.style.display = 'block';
+    const state = get3DProjectionState(flight3dCanvas);
+    draw3DBackground(flight3dCtx, flight3dCanvas, state);
+    draw3DReference(flight3dCtx, flight3dCanvas, state);
+    drawTrail3D(flight3dCtx, flight3dCanvas, trailTarget3d, '#34d399', state);
+    drawTrail3D(flight3dCtx, flight3dCanvas, trailActual3d, '#f472b6', state);
+
+    const tp3 = trailTarget3d[trailTarget3d.length - 1];
+    const ap3 = trailActual3d[trailActual3d.length - 1];
+    if(tp3) drawDot3D(flight3dCtx, flight3dCanvas, tp3, '#34d399', state, 5);
+    if(ap3) drawDot3D(flight3dCtx, flight3dCanvas, ap3, '#f472b6', state, 5);
+    if(tp3 && ap3){
+      const ap = project3DPoint(flight3dCanvas, ap3.x, ap3.y, ap3.z, state);
+      const tp = project3DPoint(flight3dCanvas, tp3.x, tp3.y, tp3.z, state);
+      flight3dCtx.strokeStyle = '#f59e0b';
+      flight3dCtx.lineWidth = 2;
+      flight3dCtx.beginPath();
+      flight3dCtx.moveTo(ap.x, ap.y);
+      flight3dCtx.lineTo(tp.x, tp.y);
+      flight3dCtx.stroke();
+    }
+  }
+
+  function setGraphMode(mode){
+    graphMode = mode;
+    tabGraph2d.classList.toggle("active", mode === "xy");
+    tabGraph3d.classList.toggle("active", mode === "3d");
+    if(mode === "3d"){
+      xyCanvas.style.display = 'none';
+      flight3dCanvas.style.display = 'block';
+      fitCanvasToCSS(flight3dCanvas);
+      flight3dCanvas.style.cursor = 'grab';
+    }else{
+      flight3dCanvas.style.display = 'none';
+      xyCanvas.style.display = 'block';
+      fitCanvasToCSS(xyCanvas);
+      flight3dCanvas.style.cursor = 'default';
+    }
+    renderFlightGraph();
+  }
+  tabGraph2d.onclick = () => setGraphMode("xy");
+  tabGraph3d.onclick = () => setGraphMode("3d");
+
+  flight3dCanvas.addEventListener('contextmenu', (e) => {
+    if(graphMode === '3d') e.preventDefault();
+  });
+
+  flight3dCanvas.addEventListener('mousedown', (e) => {
+    if(graphMode !== '3d') return;
+    drag3D.active = true;
+    drag3D.x = e.clientX;
+    drag3D.y = e.clientY;
+    drag3D.mode = (e.button === 2 || e.shiftKey || e.ctrlKey || e.metaKey) ? 'pan' : 'rotate';
+    flight3dCanvas.style.cursor = (drag3D.mode === 'pan') ? 'grabbing' : 'move';
+    e.preventDefault();
+  });
+
+  window.addEventListener('mousemove', (e) => {
+    if(!drag3D.active) return;
+    const dx = e.clientX - drag3D.x;
+    const dy = e.clientY - drag3D.y;
+    drag3D.x = e.clientX;
+    drag3D.y = e.clientY;
+
+    if(drag3D.mode === 'pan'){
+      view3D.panX += dx;
+      view3D.panY += dy;
+    }else{
+      view3D.yaw += dx * 0.012;
+      view3D.tilt = Math.max(0.18, Math.min(0.95, view3D.tilt + dy * 0.0035));
+    }
+    renderFlightGraph();
+  });
+
+  function stop3DDrag(){
+    drag3D.active = false;
+    flight3dCanvas.style.cursor = graphMode === '3d' ? 'grab' : 'default';
+  }
+  window.addEventListener('mouseup', stop3DDrag);
+  flight3dCanvas.addEventListener('mouseleave', stop3DDrag);
+  flight3dCanvas.addEventListener('mouseenter', () => {
+    if(graphMode === '3d') flight3dCanvas.style.cursor = 'grab';
+  });
+  flight3dCanvas.addEventListener('wheel', (e) => {
+    if(graphMode !== '3d') return;
+    e.preventDefault();
+    const factor = Math.exp(-e.deltaY * 0.0012);
+    view3D.zoom = Math.max(0.30, Math.min(4.0, view3D.zoom * factor));
+    renderFlightGraph();
+  }, { passive: false });
+  flight3dCanvas.addEventListener('dblclick', () => {
+    if(graphMode !== '3d') return;
+    view3D.panX = 0;
+    view3D.panY = 0;
+    view3D.zoom = 0.82;
+    view3D.yaw = 0.785398163;
+    view3D.tilt = 0.58;
+    renderFlightGraph();
+  });
+
   function updateXYPlot(msg){
     const t = msg.target || {};
     const a = msg.actual || {};
 
     if(graphOriginArmed && !graphOriginLocked && a.x != null && a.y != null){
-      graphOrigin = { x: a.x, y: a.y };
+      graphOrigin = { x: a.x, y: a.y, z: (a.z != null ? a.z : 0) };
       graphOriginLocked = true;
       graphOriginArmed = false;
       clearXYTrails();
@@ -647,8 +1003,10 @@
 
     const ax = (a.x != null) ? (a.x - graphOrigin.x) : null;
     const ay = (a.y != null) ? (a.y - graphOrigin.y) : null;
+    const az = (a.z != null) ? (a.z - graphOrigin.z) : null;
     const tx = (t.x != null) ? (t.x - graphOrigin.x) : null;
     const ty = (t.y != null) ? (t.y - graphOrigin.y) : null;
+    const tz = (t.z != null) ? (t.z - graphOrigin.z) : null;
 
     const tp = (tx != null && ty != null) ? m2p(xyCanvas, tx, ty) : null;
     const ap = (ax != null && ay != null) ? m2p(xyCanvas, ax, ay) : null;
@@ -656,18 +1014,10 @@
     const maxTrail = parseInt(trailLenEl.value, 10);
     if(tp){ trailTarget.push(tp); if(trailTarget.length > maxTrail) trailTarget.shift(); }
     if(ap){ trailActual.push(ap); if(trailActual.length > maxTrail) trailActual.shift(); }
+    if(tx != null && ty != null && tz != null){ trailTarget3d.push({x:tx, y:ty, z:tz}); if(trailTarget3d.length > maxTrail) trailTarget3d.shift(); }
+    if(ax != null && ay != null && az != null){ trailActual3d.push({x:ax, y:ay, z:az}); if(trailActual3d.length > maxTrail) trailActual3d.shift(); }
 
-    drawGrid(xyCtx, xyCanvas);
-    drawTrail(xyCtx, trailTarget, '#34d399');
-    drawTrail(xyCtx, trailActual, '#f472b6');
-
-    if(tp) drawDot(xyCtx, tp, '#34d399');
-    if(ap) drawDot(xyCtx, ap, '#f472b6');
-
-    if(tp && ap){
-      xyCtx.strokeStyle = '#f59e0b'; xyCtx.lineWidth = 2;
-      xyCtx.beginPath(); xyCtx.moveTo(ap.x, ap.y); xyCtx.lineTo(tp.x, tp.y); xyCtx.stroke();
-    }
+    renderFlightGraph();
   }
 
   // --------- CSV Logging (flight_logger-compatible + extras appended) ---------
@@ -698,7 +1048,12 @@
     "motor.m1","motor.m2","motor.m3","motor.m4",
     "imu.acc_x","imu.acc_y","imu.acc_z",
     "imu.gyro_x","imu.gyro_y","imu.gyro_z",
-    "imu.mag_x","imu.mag_y","imu.mag_z"
+    "imu.mag_x","imu.mag_y","imu.mag_z",
+
+    // --- Sim-compatible extras (real will be NaN if unavailable) ---
+    "velocity.x","velocity.y","velocity.z",
+    "motor.thrust.m1","motor.thrust.m2","motor.thrust.m3","motor.thrust.m4",
+    "motor.thrust.total"
   ];
 
   function csvEscape(v){
@@ -789,7 +1144,17 @@
 
       "imu.mag_x": raw["imu.mag_x"],
       "imu.mag_y": raw["imu.mag_y"],
-      "imu.mag_z": raw["imu.mag_z"]
+      "imu.mag_z": raw["imu.mag_z"],
+
+      // --- Sim-compatible extras (NaN on real unless vel logging works) ---
+      "velocity.x": raw["velocity.x"],
+      "velocity.y": raw["velocity.y"],
+      "velocity.z": raw["velocity.z"],
+      "motor.thrust.m1": null,  // not available from real drone
+      "motor.thrust.m2": null,
+      "motor.thrust.m3": null,
+      "motor.thrust.m4": null,
+      "motor.thrust.total": null
     };
 
     const line = FLIGHT_LOG_FIELDS.map(k => csvEscape(numOrNan(row[k]))).join(",");
@@ -825,40 +1190,121 @@
   const logDownloadBtn = document.getElementById("logDownloadBtn");
   if(logDownloadBtn) logDownloadBtn.onclick = downloadLogCSV;
 
-  // --------- Flightplan Editor (UNCHANGED) ---------
+  async function downloadPlotsZip(){
+    if(logRows.length <= 1){
+      alert("No log data yet. Start logging first.");
+      return;
+    }
+    try{
+      const stamp = (logStartEpoch || Math.floor(Date.now()/1000));
+      const resp = await fetch('/api/plots/export', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({csv: logRows.join("\n"), stamp})
+      });
+      if(!resp.ok){
+        const err = await resp.json().catch(() => ({error:'Plot export failed'}));
+        throw new Error(err.error || 'Plot export failed');
+      }
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `flight_plots_${stamp}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      addConsoleLine(`Plots ZIP downloaded: flight_plots_${stamp}.zip`, 'ok', new Date().toLocaleTimeString());
+    }catch(err){
+      alert(err.message || String(err));
+      addConsoleLine(`Plot export failed: ${err.message || err}`, 'error', new Date().toLocaleTimeString());
+    }
+  }
+
+  const logPlotsBtn = document.getElementById("logPlotsBtn");
+  if(logPlotsBtn) logPlotsBtn.onclick = downloadPlotsZip;
+
+  // --------- Flightplan Editor ---------
   const planCanvas = el("planCanvas");
   const planCtx = planCanvas.getContext("2d");
+  const plan3dPreview = el("plan3dPreview");
+  const plan3dCtx = plan3dPreview.getContext("2d");
+  const fp3dControls = el("fp3dControls");
+  const pointZDefault = el("pointZDefault");
+  const selectedPointX = el("selectedPointX");
+  const selectedPointY = el("selectedPointY");
+  const selectedPointZ = el("selectedPointZ");
 
   let fpMode = "draw";
   el("fpMode").textContent = fpMode;
+  let customTimedWaypoints = null;
 
   const tabDraw = el("tabDraw");
   const tabPoints = el("tabPoints");
+  const tab3d = el("tab3d");
+
+  function pointZValue(p){
+    if(p && p.z != null && !Number.isNaN(Number(p.z))) return Number(p.z);
+    const fallback = parseFloat(el("planZ").value);
+    return Number.isFinite(fallback) ? fallback : 0.30;
+  }
+
+  function syncSelectedPointUi(){
+    const scale = parseFloat(el("scaleInput").value || '0.50');
+    if(selectedIdx >= 0 && ptsPx[selectedIdx]){
+      const point = ptsPx[selectedIdx];
+      const m = pxToMeters(point.x, point.y, scale);
+      if(selectedPointX) selectedPointX.value = Number(m.x).toFixed(2);
+      if(selectedPointY) selectedPointY.value = Number(m.y).toFixed(2);
+      if(selectedPointZ) selectedPointZ.value = Number(pointZValue(point)).toFixed(2);
+    }else{
+      if(selectedPointX) selectedPointX.value = '0.00';
+      if(selectedPointY) selectedPointY.value = '0.00';
+      const v = parseFloat(pointZDefault.value || el("planZ").value || '0.30');
+      if(selectedPointZ) selectedPointZ.value = Number(v).toFixed(2);
+    }
+  }
 
   function setFPMode(mode){
     fpMode = mode;
     el("fpMode").textContent = mode;
+    tabDraw.classList.toggle("active", mode === "draw");
+    tabPoints.classList.toggle("active", mode === "points");
+    tab3d.classList.toggle("active", mode === "3d");
     if(mode === "draw"){
-      tabDraw.classList.add("active"); tabPoints.classList.remove("active");
+      fp3dControls.style.display = 'none';
+      plan3dPreview.style.display = 'none';
+    }else if(mode === "3d"){
+      fp3dControls.style.display = 'grid';
+      plan3dPreview.style.display = 'block';
     }else{
-      tabPoints.classList.add("active"); tabDraw.classList.remove("active");
+      fp3dControls.style.display = 'grid';
+      plan3dPreview.style.display = 'none';
     }
     selectedIdx = -1;
     draggingIdx = -1;
+    syncSelectedPointUi();
     updatePlanHud();
     redrawPlan();
   }
   tabDraw.onclick = () => setFPMode("draw");
   tabPoints.onclick = () => setFPMode("points");
+  tab3d.onclick = () => setFPMode("3d");
 
   let drawPtsPx = [];
   let ptsPx = [];
   let selectedIdx = -1;
   let draggingIdx = -1;
 
+  function clearCustomTimedWaypoints(){
+    customTimedWaypoints = null;
+  }
+
   function updatePlanHud(){
     el("ptCount").textContent = String(ptsPx.length);
     el("selIdx").textContent = (selectedIdx >= 0) ? String(selectedIdx + 1) : "--";
+    syncSelectedPointUi();
   }
 
   function hitTestPoint(px, py, radius=12){
@@ -878,7 +1324,9 @@
     for(let i=0;i<drawPtsPx.length;i+=step) sampled.push(drawPtsPx[i]);
     const last = drawPtsPx[drawPtsPx.length-1];
     if(sampled.length === 0 || sampled[sampled.length-1] !== last) sampled.push(last);
-    ptsPx = sampled.map(p => ({x:p.x, y:p.y}));
+    const baseZ = parseFloat(el("planZ").value || pointZDefault.value || '0.30');
+    ptsPx = sampled.map(p => ({x:p.x, y:p.y, z:baseZ}));
+    clearCustomTimedWaypoints();
   }
 
   function pxToMeters(px, py, scale_m_per_100px){
@@ -895,14 +1343,86 @@
     const wps = [];
     for(let i=0;i<pointsPx.length;i++){
       const m = pxToMeters(pointsPx[i].x, pointsPx[i].y, scale);
+      const pz = (fpMode === '3d' || pointsPx[i].z != null) ? pointZValue(pointsPx[i]) : z;
       if(i > 0){
         const prevm = pxToMeters(pointsPx[i-1].x, pointsPx[i-1].y, scale);
-        const d = Math.hypot(m.x - prevm.x, m.y - prevm.y);
+        const prevz = (fpMode === '3d' || pointsPx[i-1].z != null) ? pointZValue(pointsPx[i-1]) : z;
+        const d = Math.hypot(m.x - prevm.x, m.y - prevm.y, pz - prevz);
         t += d / Math.max(0.05, speed);
       }
-      wps.push({x:m.x, y:m.y, z:z, yaw:0.0, t:t});
+      wps.push({x:m.x, y:m.y, z:pz, yaw:0.0, t:t});
     }
     return wps;
+  }
+
+  function redraw3DPreview(){
+    if(!plan3dPreview) return;
+    fitCanvasToCSS(plan3dPreview);
+    if(fpMode !== '3d'){
+      plan3dCtx.clearRect(0,0,plan3dPreview.width, plan3dPreview.height);
+      return;
+    }
+
+    const ctx = plan3dCtx;
+    const w = plan3dPreview.width, h = plan3dPreview.height;
+    ctx.clearRect(0,0,w,h);
+    const g = ctx.createLinearGradient(0,0,0,h);
+    g.addColorStop(0,'#09122a');
+    g.addColorStop(1,'#0b1030');
+    ctx.fillStyle = g;
+    ctx.fillRect(0,0,w,h);
+
+    const centerX = w * 0.5;
+    const centerY = h * 0.68;
+    const scale = 90;
+
+    function proj(mx, my, mz){
+      return {
+        x: centerX + (mx - my) * scale,
+        y: centerY - (mx + my) * scale * 0.45 + mz * scale * 0.9
+      };
+    }
+
+    const cube = [
+      [-0.6,-0.6,0.0],[ 0.6,-0.6,0.0],[ 0.6, 0.6,0.0],[-0.6, 0.6,0.0],
+      [-0.6,-0.6,0.8],[ 0.6,-0.6,0.8],[ 0.6, 0.6,0.8],[-0.6, 0.6,0.8]
+    ].map(v => proj(v[0], v[1], v[2]));
+    const edges = [[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]];
+    ctx.strokeStyle = 'rgba(110,231,255,.18)';
+    ctx.lineWidth = 1;
+    for(const [a,b] of edges){
+      ctx.beginPath();
+      ctx.moveTo(cube[a].x, cube[a].y);
+      ctx.lineTo(cube[b].x, cube[b].y);
+      ctx.stroke();
+    }
+
+    const scaleM = parseFloat(el("scaleInput").value);
+    const wps = buildTimedWaypoints(ptsPx, scaleM, parseFloat(el("planZ").value), parseFloat(el("speedInput").value));
+    if(wps.length > 1){
+      ctx.strokeStyle = 'rgba(52,211,153,.85)';
+      ctx.lineWidth = 2.5;
+      ctx.beginPath();
+      const p0 = proj(wps[0].x, wps[0].y, wps[0].z);
+      ctx.moveTo(p0.x, p0.y);
+      for(let i=1;i<wps.length;i++){
+        const p = proj(wps[i].x, wps[i].y, wps[i].z);
+        ctx.lineTo(p.x, p.y);
+      }
+      ctx.stroke();
+    }
+
+    for(let i=0;i<wps.length;i++){
+      const p = proj(wps[i].x, wps[i].y, wps[i].z);
+      const isSel = i === selectedIdx;
+      ctx.fillStyle = isSel ? '#f59e0b' : '#34d399';
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, isSel ? 6 : 4, 0, Math.PI*2);
+      ctx.fill();
+      ctx.font = '12px ui-monospace, Menlo, Consolas, monospace';
+      ctx.fillStyle = 'rgba(233,236,255,.95)';
+      ctx.fillText(`${i+1} z=${Number(wps[i].z).toFixed(2)}`, p.x + 8, p.y - 8);
+    }
   }
 
   function redrawPlan(){
@@ -943,10 +1463,13 @@
       planCtx.fillStyle = 'rgba(233,236,255,.95)';
       planCtx.strokeStyle = 'rgba(3,18,32,.85)';
       planCtx.lineWidth = 4;
-      const txt = String(i+1);
+      const suffix = (fpMode === '3d' || p.z != null) ? ` z=${pointZValue(p).toFixed(2)}` : '';
+      const txt = `${i+1}${suffix}`;
       planCtx.strokeText(txt, p.x+10, p.y-10);
       planCtx.fillText(txt, p.x+10, p.y-10);
     }
+
+    redraw3DPreview();
   }
 
   let isDrawing = false;
@@ -958,6 +1481,7 @@
       isDrawing = true;
       drawPtsPx = [];
       ptsPx = [];
+      clearCustomTimedWaypoints();
       selectedIdx = -1;
       draggingIdx = -1;
       drawPtsPx.push({x:p.x, y:p.y});
@@ -976,7 +1500,9 @@
       updatePlanHud();
       redrawPlan();
     }else{
-      ptsPx.push({x:p.x, y:p.y});
+      const z = (fpMode === '3d') ? parseFloat(pointZDefault.value || el("planZ").value || '0.30') : parseFloat(el("planZ").value || '0.30');
+      ptsPx.push({x:p.x, y:p.y, z});
+      clearCustomTimedWaypoints();
       selectedIdx = ptsPx.length - 1;
       draggingIdx = selectedIdx;
       planCanvas.setPointerCapture(e.pointerId);
@@ -999,7 +1525,9 @@
     }
 
     if(draggingIdx >= 0){
-      ptsPx[draggingIdx] = {x:p.x, y:p.y};
+      const prev = ptsPx[draggingIdx] || {};
+      ptsPx[draggingIdx] = {x:p.x, y:p.y, z:pointZValue(prev)};
+      clearCustomTimedWaypoints();
       redrawPlan();
     }
   });
@@ -1015,9 +1543,56 @@
     redrawPlan();
   });
 
+  function setSelectedPointFromMeters(partial = {}){
+    if(selectedIdx < 0 || !ptsPx[selectedIdx]) return;
+    const scale = parseFloat(el("scaleInput").value || '0.50');
+    const current = ptsPx[selectedIdx];
+    const currentMeters = pxToMeters(current.x, current.y, scale);
+    const nextMeters = {
+      x: (partial.x != null ? partial.x : currentMeters.x),
+      y: (partial.y != null ? partial.y : currentMeters.y)
+    };
+    const cx = planCanvas.width/2, cy = planCanvas.height/2;
+    const s = scale / 100.0;
+    ptsPx[selectedIdx] = {
+      x: cx + (nextMeters.x / s),
+      y: cy - (nextMeters.y / s),
+      z: (partial.z != null ? partial.z : pointZValue(current))
+    };
+    clearCustomTimedWaypoints();
+    redrawPlan();
+    updatePlanHud();
+  }
+
+  if(selectedPointX){
+    selectedPointX.addEventListener('input', () => {
+      if(selectedIdx < 0 || !ptsPx[selectedIdx]) return;
+      setSelectedPointFromMeters({x: parseFloat(selectedPointX.value || '0')});
+    });
+  }
+  if(selectedPointY){
+    selectedPointY.addEventListener('input', () => {
+      if(selectedIdx < 0 || !ptsPx[selectedIdx]) return;
+      setSelectedPointFromMeters({y: parseFloat(selectedPointY.value || '0')});
+    });
+  }
+  if(selectedPointZ){
+    selectedPointZ.addEventListener('input', () => {
+      if(selectedIdx < 0 || !ptsPx[selectedIdx]) return;
+      setSelectedPointFromMeters({z: parseFloat(selectedPointZ.value || pointZDefault.value || '0.30')});
+    });
+  }
+  if(pointZDefault){
+    pointZDefault.addEventListener('input', () => {
+      syncSelectedPointUi();
+      redrawPlan();
+    });
+  }
+
   el("delSelectedBtn").onclick = () => {
     if(selectedIdx < 0) return;
     ptsPx.splice(selectedIdx, 1);
+    clearCustomTimedWaypoints();
     selectedIdx = Math.min(selectedIdx, ptsPx.length - 1);
     draggingIdx = -1;
     updatePlanHud();
@@ -1027,6 +1602,7 @@
   el("clearPlanBtn").onclick = () => {
     drawPtsPx = [];
     ptsPx = [];
+    clearCustomTimedWaypoints();
     selectedIdx = -1;
     draggingIdx = -1;
     updatePlanHud();
@@ -1038,7 +1614,7 @@
     const speed = parseFloat(el("speedInput").value);
     const z = parseFloat(el("planZ").value);
     const loop = (el("loopSelect").value === "true");
-    const wps = buildTimedWaypoints(ptsPx, scale, z, speed);
+    const wps = customTimedWaypoints ? customTimedWaypoints.map(wp => ({...wp})) : buildTimedWaypoints(ptsPx, scale, z, speed);
     wsSend({type:"plan", waypoints:wps, loop:loop});
   };
 
@@ -1053,15 +1629,16 @@
       const s = u * 2*Math.PI;
       const x = amp * Math.sin(s);
       const y = (amp*0.5) * Math.sin(s) * Math.cos(s);
-      meterPts.push({x,y});
+      meterPts.push({x,y,z});
     }
 
     const scale_m_per_100px = parseFloat(el("scaleInput").value);
     const s = scale_m_per_100px / 100.0;
     const cx = planCanvas.width/2, cy = planCanvas.height/2;
 
-    ptsPx = meterPts.map(m => ({ x: cx + (m.x / s), y: cy - (m.y / s) }));
-    drawPtsPx = ptsPx.slice();
+    ptsPx = meterPts.map(m => ({ x: cx + (m.x / s), y: cy - (m.y / s), z: m.z }));
+    drawPtsPx = ptsPx.map(p => ({x:p.x, y:p.y}));
+    clearCustomTimedWaypoints();
     selectedIdx = -1; draggingIdx = -1;
 
     updatePlanHud();
@@ -1071,14 +1648,89 @@
     const wps = buildTimedWaypoints(ptsPx, scale_m_per_100px, z, speed);
     wsSend({type:"plan", waypoints:wps, loop:true});
   }
+
+  async function presetFigure8_3d(){
+    try{
+      const resp = await fetch('/api/flightplans/figure8_3d_eval');
+      const data = await resp.json();
+      if(!resp.ok) throw new Error(data.error || 'Failed to load 3D figure-eight preset');
+
+      customTimedWaypoints = (data.waypoints || []).map(wp => ({
+        x: Number(wp.x),
+        y: Number(wp.y),
+        z: Number(wp.z),
+        yaw: Number(wp.yaw || 0.0),
+        t: Number(wp.t),
+      }));
+
+      const scale_m_per_100px = parseFloat(el("scaleInput").value);
+      const s = scale_m_per_100px / 100.0;
+      const cx = planCanvas.width/2, cy = planCanvas.height/2;
+      ptsPx = customTimedWaypoints.map(wp => ({
+        x: cx + (wp.x / s),
+        y: cy - (wp.y / s),
+        z: wp.z
+      }));
+      drawPtsPx = ptsPx.map(p => ({x:p.x, y:p.y}));
+      selectedIdx = 0;
+      draggingIdx = -1;
+      setFPMode('3d');
+      updatePlanHud();
+      redrawPlan();
+      wsSend({type:"plan", waypoints: customTimedWaypoints.map(wp => ({...wp})), loop: data.loop !== false});
+      addConsoleLine(`Preset loaded: 3D Figure 8 (${customTimedWaypoints.length} waypoints)`, "ok", new Date().toLocaleTimeString());
+    }catch(err){
+      alert(err.message || String(err));
+      addConsoleLine(`Failed to load 3D Figure 8 preset: ${err.message || err}`, "error", new Date().toLocaleTimeString());
+    }
+  }
+
+  function presetCube(){
+    const zBase = parseFloat(pointZDefault.value || el("planZ").value || '0.30');
+    const cubePts = [
+      {x:-0.45,y:-0.45,z:zBase},
+      {x: 0.45,y:-0.45,z:zBase},
+      {x: 0.45,y: 0.45,z:zBase},
+      {x:-0.45,y: 0.45,z:zBase},
+      {x:-0.45,y:-0.45,z:zBase+0.45},
+      {x: 0.45,y:-0.45,z:zBase+0.45},
+      {x: 0.45,y: 0.45,z:zBase+0.45},
+      {x:-0.45,y: 0.45,z:zBase+0.45},
+      {x:-0.45,y:-0.45,z:zBase}
+    ];
+    const scale_m_per_100px = parseFloat(el("scaleInput").value);
+    const s = scale_m_per_100px / 100.0;
+    const cx = planCanvas.width/2, cy = planCanvas.height/2;
+    ptsPx = cubePts.map(m => ({ x: cx + (m.x / s), y: cy - (m.y / s), z: m.z }));
+    drawPtsPx = ptsPx.map(p => ({x:p.x, y:p.y}));
+    clearCustomTimedWaypoints();
+    selectedIdx = 0; draggingIdx = -1;
+    setFPMode('3d');
+    updatePlanHud();
+    redrawPlan();
+  }
+
   el("presetFig8Btn").onclick = presetFigure8;
+  el("presetFig83DBtn").onclick = presetFigure8_3d;
+  el("presetCubeBtn").onclick = presetCube;
 
   // ========= Resize handling =========
+
   function resizeAllCanvases(){
-    fitCanvasToCSS(xyCanvas);
+    if(graphMode === '3d') fitCanvasToCSS(flight3dCanvas);
+    else fitCanvasToCSS(xyCanvas);
     fitCanvasToCSS(planCanvas);
-    drawGrid(xyCtx, xyCanvas);
+    fitCanvasToCSS(plan3dPreview);
+    renderFlightGraph();
     redrawPlan();
+  }
+
+  if(window.ResizeObserver){
+    const ro = new ResizeObserver(() => resizeAllCanvases());
+    const graphWrap = xyCanvas.parentElement;
+    if(graphWrap) ro.observe(graphWrap);
+    const planWrap = planCanvas.parentElement;
+    if(planWrap) ro.observe(planWrap);
   }
 
   // --------- Init ---------
@@ -1086,6 +1738,7 @@
   connectWS();
 
   window.addEventListener("resize", resizeAllCanvases);
+  requestAnimationFrame(resizeAllCanvases);
   resizeAllCanvases();
 
   updatePlanHud();
